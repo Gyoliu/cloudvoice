@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- 生产环境可填写后端源地址；留空时本地开发使用 8000 端口，部署时使用同源地址。 -->
+    <meta name="google-voice-api-origin" content="">
+    <title>Google Voice 平台</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <h1>Google Voice Web 平台</h1>
+
+    <!-- 模块1：TTS (文字转语音) -->
+    <section class="module" id="tts-section">
+        <h2>1. 文字转语音 (TTS)</h2>
+        <textarea id="tts-text" rows="4" placeholder="输入要转换为语音的文字..."></textarea>
+        <button id="btn-tts">生成语音并播放</button>
+        <audio id="tts-audio" controls style="display: none;"></audio>
+    </section>
+
+    <!-- 模块2：STT 上传录音 -->
+    <section class="module" id="stt-upload-section">
+        <h2>2. 语音转文字 (文件上传)</h2>
+        <input type="file" id="stt-file-input" accept="audio/*">
+        <button id="btn-upload">上传并识别</button>
+        <p>识别结果: <span id="upload-result" class="result">无</span></p>
+    </section>
+
+    <!-- 模块3：STT 实时录音 -->
+    <section class="module" id="stt-realtime-section">
+        <h2>3. 语音转文字 (实时录音)</h2>
+        <button id="btn-start-record">开始录音</button>
+        <button id="btn-stop-record" disabled>停止录音</button>
+        <p>实时识别结果: <span id="realtime-result" class="result">无</span></p>
+    </section>
+
+    <script src="app.js"></script>
+</body>
+</html>
