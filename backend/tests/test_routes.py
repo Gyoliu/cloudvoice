@@ -2,7 +2,7 @@ import asyncio
 
 from httpx import ASGITransport, AsyncClient
 from main import app
-from services.tts_service import TTSService
+from services.tts_service import GeneratedAudio, TTSService
 
 
 def request(method: str, path: str, **kwargs):
@@ -27,7 +27,7 @@ def test_tts_rejects_unknown_voice():
 def test_tts_hides_internal_service_error(monkeypatch):
     """上游异常详情不应透传给 API 调用方。"""
 
-    def raise_internal_error(_text, _voice_name):
+    async def raise_internal_error(_text, _voice_name):
         raise RuntimeError("sensitive upstream detail")
 
     monkeypatch.setattr(TTSService, "generate_audio", raise_internal_error)
@@ -36,6 +36,63 @@ def test_tts_hides_internal_service_error(monkeypatch):
     assert response.status_code == 502
     assert response.json() == {"detail": "语音生成服务暂时不可用"}
     assert "sensitive upstream detail" not in response.text
+
+
+def test_tts_uses_generated_audio_media_type_and_provider(monkeypatch):
+    """TTS 路由应返回实际编码类型，并标识最终使用的提供方。"""
+
+    async def generate_edge_audio(_text, _voice_name):
+        return GeneratedAudio(
+            content=b"mp3-audio",
+            media_type="audio/mpeg",
+            provider="microsoft-edge",
+        )
+
+    monkeypatch.setattr(TTSService, "generate_audio", generate_edge_audio)
+    response = request("POST", "/api/tts", json={"text": "测试"})
+
+    assert response.status_code == 200
+    assert response.content == b"mp3-audio"
+    assert response.headers["content-type"] == "audio/mpeg"
+    assert response.headers["x-tts-provider"] == "microsoft-edge"
+
+
+def test_edge_tts_stream_returns_mp3_chunks_without_fallback(monkeypatch):
+    """流式接口应仅透传 Edge MP3 分片，并明确禁止代理缓冲。"""
+
+    async def generate_stream(_text):
+        yield b"mp3-first"
+        yield b"mp3-second"
+
+    async def unexpected_fallback(_text, _voice_name):
+        raise AssertionError("流式接口不应调用普通 TTS 降级链路")
+
+    monkeypatch.setattr(TTSService, "stream_edge_audio", generate_stream)
+    monkeypatch.setattr(TTSService, "generate_audio", unexpected_fallback)
+    response = request("POST", "/api/tts/stream", json={"text": "测试"})
+
+    assert response.status_code == 200
+    assert response.content == b"mp3-firstmp3-second"
+    assert response.headers["content-type"] == "audio/mpeg"
+    assert response.headers["x-tts-provider"] == "microsoft-edge"
+    assert response.headers["x-accel-buffering"] == "no"
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_edge_tts_stream_returns_502_before_first_chunk(monkeypatch):
+    """Edge 在首个分片前失败时应返回通用错误且不尝试 Google。"""
+
+    async def fail_before_first_chunk(_text):
+        if False:
+            yield b"unreachable"
+        raise ConnectionError("sensitive edge detail")
+
+    monkeypatch.setattr(TTSService, "stream_edge_audio", fail_before_first_chunk)
+    response = request("POST", "/api/tts/stream", json={"text": "测试"})
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Edge 流式语音服务暂时不可用"}
+    assert "sensitive edge detail" not in response.text
 
 
 def test_stt_upload_rejects_non_audio_file():

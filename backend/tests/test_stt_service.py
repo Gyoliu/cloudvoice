@@ -24,6 +24,17 @@ class FailingModels:
         raise RuntimeError("upstream failed")
 
 
+class SuccessfulModels:
+    """记录模型配置并返回固定转录结果。"""
+
+    def __init__(self):
+        self.config = None
+
+    def generate_content(self, **kwargs):
+        self.config = kwargs["config"]
+        return SimpleNamespace(text="转录结果")
+
+
 def test_transcribe_file_deletes_remote_file_when_models_fail(monkeypatch):
     """模型失败时也必须删除 Gemini 远端临时音频。"""
     fake_files = FakeFiles()
@@ -34,3 +45,16 @@ def test_transcribe_file_deletes_remote_file_when_models_fail(monkeypatch):
         stt_service.STTService.transcribe_file("test.wav", "audio/wav")
 
     assert fake_files.deleted_names == ["files/test-audio"]
+
+
+def test_transcribe_file_disables_automatic_function_calling(monkeypatch):
+    """普通音频转录不应启用 SDK 的自动函数调用。"""
+    fake_files = FakeFiles()
+    fake_models = SuccessfulModels()
+    fake_client = SimpleNamespace(files=fake_files, models=fake_models)
+    monkeypatch.setattr(stt_service.clients, "gemini_client", fake_client)
+
+    result = stt_service.STTService.transcribe_file("test.wav", "audio/wav")
+
+    assert result == "转录结果"
+    assert fake_models.config.automatic_function_calling.disable is True

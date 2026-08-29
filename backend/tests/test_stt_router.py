@@ -3,13 +3,27 @@ import asyncio
 import pytest
 from fastapi import HTTPException
 from routers.stt import (
+    LIVE_LANGUAGE_CODE,
+    LIVE_MODEL,
     StreamProtocolError,
     StreamState,
     browser_to_gemini,
+    build_live_transcription_config,
+    gemini_to_browser,
     normalize_audio_mime_type,
     parse_control_message,
     update_stream_state,
 )
+
+
+def test_live_transcription_uses_dedicated_chinese_model():
+    """实时 STT 应使用专用模型并固定简体普通话，避免短句误判语种。"""
+    config = build_live_transcription_config()
+
+    assert LIVE_MODEL == "gemini-3.5-transcribe-live"
+    assert config.response_modalities == ["TEXT"]
+    assert config.input_audio_transcription.language_codes == [LIVE_LANGUAGE_CODE]
+    assert config.input_audio_transcription.mode == "SMART"
 
 
 def test_normalize_audio_mime_type_removes_parameters():
@@ -76,3 +90,61 @@ def test_browser_to_gemini_sends_pcm_before_stream_end():
     assert audio_buffer == b"\x01\x02"
     assert session.calls[0]["audio"].mime_type == "audio/pcm;rate=48000"
     assert session.calls[-1] == {"audio_stream_end": True}
+
+
+def test_gemini_receiver_continues_after_normal_turn_completion():
+    """receive() 的单轮正常结束不应被误判为 Live 通道断开。"""
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.messages = []
+
+        async def send_json(self, message):
+            self.messages.append(message)
+
+    state = StreamState()
+
+    class FakeSession:
+        def __init__(self):
+            self.receive_calls = 0
+
+        def receive(self):
+            self.receive_calls += 1
+            call_number = self.receive_calls
+
+            async def stream():
+                if call_number == 1:
+                    yield type(
+                        "Response",
+                        (),
+                        {"server_content": type("ServerContent", (), {"turn_complete": True})()},
+                    )()
+                    return
+
+                state.stop_received = True
+                transcription = type("Transcription", (), {"text": "测试结果"})()
+                yield type(
+                    "Response",
+                    (),
+                    {
+                        "server_content": type(
+                            "ServerContent",
+                            (),
+                            {
+                                "turn_complete": True,
+                                "input_transcription": transcription,
+                            },
+                        )()
+                    },
+                )()
+
+            return stream()
+
+    websocket = FakeWebSocket()
+    session = FakeSession()
+
+    asyncio.run(gemini_to_browser(websocket, session, state))
+
+    assert session.receive_calls == 2
+    assert state.final_segments == ["测试结果"]
+    assert websocket.messages[-1]["phase"] == "confirmed"

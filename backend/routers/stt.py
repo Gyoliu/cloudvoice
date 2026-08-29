@@ -15,7 +15,8 @@ from services.stt_service import STTService
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-LIVE_MODEL = "gemini-3.1-flash-live-preview"
+LIVE_MODEL = "gemini-3.5-transcribe-live"
+LIVE_LANGUAGE_CODE = "cmn-Hans-CN"
 LIVE_RECEIVE_TIMEOUT_SECONDS = 10
 DEFAULT_SAMPLE_RATE = 16_000
 
@@ -87,6 +88,17 @@ def raise_if_disconnected(message: dict) -> None:
     """将 Starlette 原始断开消息转换为可统一处理的异常。"""
     if message.get("type") == "websocket.disconnect":
         raise WebSocketDisconnect(code=message.get("code", 1000))
+
+
+def build_live_transcription_config() -> types.LiveConnectConfig:
+    """构建固定为简体普通话的专用实时转录配置。"""
+    return types.LiveConnectConfig(
+        response_modalities=["TEXT"],
+        input_audio_transcription=types.AudioTranscriptionConfig(
+            language_codes=[LIVE_LANGUAGE_CODE],
+            mode=types.AudioTranscriptionConfigMode.SMART,
+        ),
+    )
 
 
 @router.post("/api/stt/upload")
@@ -210,32 +222,41 @@ async def browser_to_gemini(
 
 
 async def gemini_to_browser(websocket: WebSocket, session, state: StreamState) -> None:
-    """读取 Gemini 输入音频转录事件并推送给浏览器。"""
-    async for response in session.receive():
-        server_content = getattr(response, "server_content", None)
-        if not server_content:
-            continue
+    """跨多个模型轮次读取输入音频转录事件并推送给浏览器。"""
+    while True:
+        received_message = False
+        async for response in session.receive():
+            received_message = True
+            server_content = getattr(response, "server_content", None)
+            if not server_content:
+                continue
 
-        interim = getattr(server_content, "interim_input_transcription", None)
-        interim_text = (getattr(interim, "text", "") or "").strip()
-        if interim_text:
-            visible_text = "".join(state.final_segments) + interim_text
-            await websocket.send_json({"is_final": False, "text": visible_text, "phase": "interim"})
+            interim = getattr(server_content, "interim_input_transcription", None)
+            interim_text = (getattr(interim, "text", "") or "").strip()
+            if interim_text:
+                visible_text = "".join(state.final_segments) + interim_text
+                await websocket.send_json(
+                    {"is_final": False, "text": visible_text, "phase": "interim"}
+                )
 
-        final = getattr(server_content, "input_transcription", None)
-        final_text = (getattr(final, "text", "") or "").strip()
-        if final_text and (not state.final_segments or state.final_segments[-1] != final_text):
-            state.final_segments.append(final_text)
-            await websocket.send_json(
-                {
-                    "is_final": False,
-                    "text": "".join(state.final_segments),
-                    "phase": "confirmed",
-                }
-            )
+            final = getattr(server_content, "input_transcription", None)
+            final_text = (getattr(final, "text", "") or "").strip()
+            if final_text and (not state.final_segments or state.final_segments[-1] != final_text):
+                state.final_segments.append(final_text)
+                await websocket.send_json(
+                    {
+                        "is_final": False,
+                        "text": "".join(state.final_segments),
+                        "phase": "confirmed",
+                    }
+                )
 
-        if state.stop_received and getattr(server_content, "turn_complete", False):
-            return
+            if state.stop_received and getattr(server_content, "turn_complete", False):
+                return
+
+        # SDK 的 receive() 每个模型轮次都会正常结束；录音未停止时继续等待下一轮。
+        if not received_message:
+            raise RuntimeError("Gemini Live 接收连接已关闭")
 
 
 async def run_live_transcription(
@@ -294,10 +315,7 @@ async def speech_to_text_stream_route(websocket: WebSocket):
             await run_fallback_buffer_mode(websocket, audio_buffer, state)
             return
 
-        live_config = types.LiveConnectConfig(
-            response_modalities=["TEXT"],
-            input_audio_transcription=types.AudioTranscriptionConfig(),
-        )
+        live_config = build_live_transcription_config()
         async with live_api.connect(model=LIVE_MODEL, config=live_config) as session:
             await websocket.send_json(
                 {
@@ -324,6 +342,7 @@ async def speech_to_text_stream_route(websocket: WebSocket):
     finally:
         try:
             await websocket.close()
+        except WebSocketDisconnect:
+            pass
         except RuntimeError:
-            # WebSocket 已由客户端或框架关闭时无需重复关闭。
             pass

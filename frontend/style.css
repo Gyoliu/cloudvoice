@@ -41,6 +41,22 @@ button:disabled {
     cursor: not-allowed;
 }
 
+.tts-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.tts-actions button {
+    margin-right: 0;
+}
+
+.module-hint {
+    margin: 10px 0 0;
+    color: #5f6368;
+    font-size: 0.85rem;
+}
+
 .result {
     font-weight: bold;
     color: #34a853;
@@ -49,4 +65,75 @@ button:disabled {
 audio {
     margin-top: 10px;
     display: block;
+}
+
+/* 2-Column Layout */
+.layout-container {
+    display: flex;
+    flex-direction: row;
+    gap: 20px;
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+.left-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+}
+
+.right-panel {
+    flex: 1;
+    background-color: #f9f9f9;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    max-height: 800px;
+}
+
+.right-panel h2 {
+    margin-top: 0;
+    font-size: 1.2em;
+    border-bottom: 1px solid #ccc;
+    padding-bottom: 10px;
+}
+
+.logs-container {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    font-family: monospace;
+    font-size: 0.9em;
+}
+
+.log-entry {
+    padding: 8px 12px;
+    border-radius: 4px;
+    background: #fff;
+    border-left: 4px solid #4285f4;
+    word-break: break-all;
+}
+
+.log-entry.error {
+    border-left-color: #ea4335;
+    color: #ea4335;
+    background: #fce8e6;
+}
+
+.log-entry.system-welcome {
+    border-left-color: #34a853;
+    color: #34a853;
+}
+
+.log-entry strong {
+    color: #202124;
+    display: block;
+    margin-bottom: 4px;
+}
+.log-entry.success {
+    border-left-color: #34a853;
 }

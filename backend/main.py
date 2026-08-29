@@ -21,4 +21,11 @@ app.include_router(stt.router, tags=["STT"])
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        # 开发重载时不要无限等待仍保持连接的浏览器 WebSocket。
+        timeout_graceful_shutdown=5,
+    )

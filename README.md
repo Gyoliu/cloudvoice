@@ -2,8 +2,8 @@
 
 ## 项目简介
 本项目是一个基于 Web 架构的语音转换平台，包含两个核心功能：
-1. **文字转语音 (TTS)**：输入文字，生成音频文件并在网页端播放。
-2. **语音转文字 (STT)**：在网页端实时录音或上传音频文件，服务端识别后返回文字。
+1. **文字转语音 (TTS)**：支持普通播放和 Edge-only 流式播放；普通模式失败时可自动降级至 Google Gemini TTS。
+2. **语音转文字 (STT)**：桌面 Edge 优先使用浏览器 SpeechRecognition；不可用时自动切换现有后端，上传文件仍由服务端识别。
 
 ## 工程目录结构
 ```text
@@ -16,7 +16,7 @@ googlecloudvoice/
 │   └── pcm-recorder-worklet.js # AudioWorklet PCM 采集器
 ├── backend/              # 后端项目 (API 服务)
 │   ├── routers/          # HTTP 与 WebSocket 路由
-│   ├── services/         # Gemini STT/TTS 服务
+│   ├── services/         # Edge TTS、Gemini STT/TTS 服务与降级逻辑
 │   └── tests/            # 后端单元测试
 └── README.md             # 项目入口文档
 ```
@@ -42,8 +42,9 @@ googlecloudvoice/
     python main.py
 
   启动成功后，后端会在 http://0.0.0.0:8000 监听请求。
-  确保 `backend/.env` 文件中已经配置 `GEMINI_API_KEY`。本项目使用 Gemini Developer API，
-  不需要 `GOOGLE_APPLICATION_CREDENTIALS`。
+  确保 `backend/.env` 文件中已经配置 `GEMINI_API_KEY`。该密钥用于 STT 和 TTS 的
+  Google 降级路径；TTS 首选 `zh-CN-YunxiNeural`，不需要额外的 Microsoft 凭据。
+  本项目使用 Gemini Developer API，不需要 `GOOGLE_APPLICATION_CREDENTIALS`。
 
 #### 2. 启动前端 (Web 界面)
 
@@ -60,8 +61,10 @@ googlecloudvoice/
   #### 3. 体验！
 
   现在，在浏览器里访问 👉 http://localhost:3000
-  你就可以体验 TTS、文件上传 STT，以及利用 WebSocket 和 PCM 流实现的实时麦克风转录。
-  现代浏览器优先使用 AudioWorklet，缺少该能力时自动使用兼容采集路径。
+  你就可以体验普通 TTS、Edge TTS 边生成边播放、文件上传 STT 和实时麦克风转录。
+  桌面版 Microsoft Edge 87 及以上且 SpeechRecognition 可用时，实时录音直接使用浏览器识别，
+  不请求本项目后端；其他浏览器、旧版 Edge、策略禁用或运行时服务失败时，自动切换 WebSocket + PCM 路径。
+  后端路径优先使用 AudioWorklet，缺少该能力时自动使用兼容采集方式。
 
   如果前后端不是同源部署，可编辑 `frontend/index.html` 中的 `google-voice-api-origin` meta 配置；
   HTTPS 页面会自动使用 `wss://` WebSocket。

@@ -2,7 +2,7 @@
 
 ## 1. 方案定位
 本项目完全基于 Google AI Studio 提供的**免费层级 (Free Tier)** 构建。
-无论是文本生成、音频解析 (STT) 还是音频合成 (TTS)，核心接口统一采用同步的 `generate_content` API，实现整个项目的 **0 成本** 运行。
+音频解析 (STT) 使用 Gemini API；音频合成 (TTS) 优先使用 Edge TTS，只有 Edge 失败时才调用 Gemini `generate_content` 降级。
 
 ## 2. 免费层级核心规则
 根据官方定价文档，针对我们使用的 Gemini Flash 模型，免费方案的具体参数如下：
@@ -15,12 +15,13 @@
   *评估：对于个人开发、日常工具或小范围使用的自动化播报系统，该额度完全足够支撑。*
 
 ## 3. 架构调用实现 (主从降级策略)
-为了保证系统在高并发或预览版模型限流时依然可用，本项目在核心的 STT 和 TTS 服务中均引入了 **主从降级 (Fallback)** 机制：
+为了提高可用性，项目在 STT 和 TTS 服务中均引入了 **降级 (Fallback)** 机制：
 
 1. **文字转语音 (TTS - 单人音频)**：
-   - **首选模型**：`gemini-3.1-flash-tts-preview`（专为单人、连贯长文本音频输出优化）。
-   - **降级模型**：`gemini-2.5-flash-preview-tts`（专为 TTS 优化的上一代预览模型）。
-   - **逻辑**：请求首选模型生成 `response_modalities=["AUDIO"]`，若遇到限流或失败，自动切换至降级模型重新生成。
+   - **首选服务**：Microsoft Edge TTS，固定使用 `zh-CN-YunxiNeural` 中文男声并返回 MP3。
+   - **降级服务**：Google Gemini TTS，默认使用 `Charon` 男声并返回 WAV。
+   - **逻辑**：Edge TTS 连接、接收、超时或空音频均视为失败；后端随后在线程池调用现有 Gemini 模型组，避免阻塞异步接口。
+   - **流式例外**：`/api/tts/stream` 直接透传 Edge MP3 分片，严格不调用 Gemini；上游失败时返回 502 或提前结束已经开始的响应流。
 
 2. **语音转文字 (STT - 文件上传与缓冲录音)**：
    - **首选模型**：`gemini-3.6-flash`（最新、最强智商与速度表现）。

@@ -29,8 +29,14 @@ class STTService:
                 config=upload_config,
             )
             prompt = (
-                "你是一个精准的语音转录助手。请将这段音频中的所有语音完全、准确地"
-                "转录为文字，不要添加任何额外的解释或对话，只输出转录的文本："
+                "你是一个精准的简体中文语音转录助手。这段音频默认使用普通话中文；"
+                "除非音频中存在清晰、完整的外语表达，否则不要切换到其他语言或文字体系。"
+                "请完整、准确地转录所有语音，不要添加解释或对话，只输出转录文本："
+            )
+            # 纯音频转录不使用工具，显式关闭 SDK 默认 AFC，避免额外调度和警告。
+            generation_config = types.GenerateContentConfig(
+                temperature=0.0,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
             )
 
             try:
@@ -38,7 +44,7 @@ class STTService:
                 response = clients.gemini_client.models.generate_content(
                     model="gemini-3.6-flash",
                     contents=[prompt, audio_file],
-                    config=types.GenerateContentConfig(temperature=0.0),
+                    config=generation_config,
                 )
             except Exception:
                 logger.warning(
@@ -49,7 +55,7 @@ class STTService:
                 response = clients.gemini_client.models.generate_content(
                     model="gemini-3.5-flash",
                     contents=[prompt, audio_file],
-                    config=types.GenerateContentConfig(temperature=0.0),
+                    config=generation_config,
                 )
             transcript = (response.text or "").strip()
             if not transcript:

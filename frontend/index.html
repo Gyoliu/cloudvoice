@@ -11,29 +11,46 @@
 <body>
     <h1>Google Voice Web 平台</h1>
 
-    <!-- 模块1：TTS (文字转语音) -->
-    <section class="module" id="tts-section">
-        <h2>1. 文字转语音 (TTS)</h2>
-        <textarea id="tts-text" rows="4" placeholder="输入要转换为语音的文字..."></textarea>
-        <button id="btn-tts">生成语音并播放</button>
-        <audio id="tts-audio" controls style="display: none;"></audio>
-    </section>
+    <div class="layout-container">
+        <div class="left-panel">
+            <!-- 模块1：TTS (文字转语音) -->
+            <section class="module" id="tts-section">
+                <h2>1. 文字转语音 (TTS)</h2>
+                <textarea id="tts-text" rows="4" placeholder="输入要转换为语音的文字..."></textarea>
+                <div class="tts-actions">
+                    <button id="btn-tts">生成语音并播放</button>
+                    <button id="btn-tts-stream">Edge 流式播放</button>
+                    <button id="btn-tts-stream-stop" disabled>停止播放</button>
+                </div>
+                <p class="module-hint">流式播放固定使用中文男声 zh-CN-YunxiNeural，不会调用 Google。</p>
+                <audio id="tts-audio" controls style="display: none;"></audio>
+            </section>
 
-    <!-- 模块2：STT 上传录音 -->
-    <section class="module" id="stt-upload-section">
-        <h2>2. 语音转文字 (文件上传)</h2>
-        <input type="file" id="stt-file-input" accept="audio/*">
-        <button id="btn-upload">上传并识别</button>
-        <p>识别结果: <span id="upload-result" class="result">无</span></p>
-    </section>
+            <!-- 模块2：STT 上传录音 -->
+            <section class="module" id="stt-upload-section">
+                <h2>2. 语音转文字 (文件上传)</h2>
+                <input type="file" id="stt-file-input" accept="audio/*">
+                <button id="btn-upload">上传并识别</button>
+                <p>识别结果: <span id="upload-result" class="result">无</span></p>
+            </section>
 
-    <!-- 模块3：STT 实时录音 -->
-    <section class="module" id="stt-realtime-section">
-        <h2>3. 语音转文字 (实时录音)</h2>
-        <button id="btn-start-record">开始录音</button>
-        <button id="btn-stop-record" disabled>停止录音</button>
-        <p>实时识别结果: <span id="realtime-result" class="result">无</span></p>
-    </section>
+            <!-- 模块3：STT 实时录音 -->
+            <section class="module" id="stt-realtime-section">
+                <h2>3. 语音转文字 (实时录音)</h2>
+                <button id="btn-start-record">开始录音</button>
+                <button id="btn-stop-record" disabled>停止录音</button>
+                <p id="stt-realtime-engine" class="module-hint">正在检测浏览器语音识别能力...</p>
+                <p>实时识别结果: <span id="realtime-result" class="result">无</span></p>
+            </section>
+        </div>
+
+        <div class="right-panel">
+            <h2>系统通信记录</h2>
+            <div id="system-logs" class="logs-container">
+                <div class="log-entry system-welcome">欢迎使用 Google Voice Web 平台！</div>
+            </div>
+        </div>
+    </div>
 
     <script src="app.js"></script>
 </body>

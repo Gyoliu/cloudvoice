@@ -1,17 +1,21 @@
 # 核心模型增强与个性化参数配置指南
 
-基于我们目前选定的高级模型矩阵，除了最基础的输入输出外，Gemini SDK 提供了非常丰富的配置项（`GenerateContentConfig` 和提示词工程）。你可以通过在代码中注入这些参数，来大幅增强应用的能力或定制个性化体验。
+项目的 TTS 优先使用 Microsoft Edge TTS，STT 与 TTS 降级路径使用 Gemini。下列参数用于说明各路径的可配置能力。
 
 ---
 
 ## 1. 文字转语音 (TTS) 个性化参数
-**核心模型**：`gemini-3.1-flash-tts-preview` / `gemini-2.5-flash-preview-tts`
+**首选服务**：Microsoft Edge TTS，固定中文男声 `zh-CN-YunxiNeural`，输出 MP3。
+
+**降级服务**：Google Gemini TTS 模型组，输出 WAV。
+
+**流式播放**：`POST /api/tts/stream` 仅使用 Edge TTS。浏览器通过 MediaSource 逐块追加 `audio/mpeg` 数据；Edge 失败时结束请求，不调用 Gemini。
 
 ### 可配置参数：
-*   **`voice_name` (音色选择)**
-    *   **作用**：决定播报员的基础音色。
+*   **`voice_name`（Gemini 降级音色）**
+    *   **作用**：仅在 Edge TTS 失败并切换到 Gemini 后决定播报员的基础音色，默认 `Charon` 男声。
     *   **可选值**：`Aoede` (温和女声)、`Puck` (活力男声)、`Charon` (沉稳男声)、`Kore` (清脆女声)、`Fenrir` (粗犷男声)、`Leda` (知性女声)。
-    *   *配置方法*：在 `PrebuiltVoiceConfig` 中传入。
+    *   *配置方法*：通过 `/api/tts` 请求字段传入；正常 Edge 路径始终使用 `zh-CN-YunxiNeural`。
 
 *   **`system_instruction` (系统指令 / 人设注入)**
     *   **作用**：这是 Gemini 语音生成最强大的特性！你可以通过文本规定它“带有什么样的情绪去朗读”。
@@ -44,19 +48,30 @@
 
 ---
 
-## 3. 双向流式对话 (Live API) 增强参数
-**核心模型**：`gemini-3.1-flash-live-preview`
+## 3. 实时语音转录参数
 
-当前项目通过 `input_audio_transcription` 接收用户输入音频的实时转录，而不是读取模型回复文本。
+**首选路径**：桌面 Microsoft Edge 87+ 的 `SpeechRecognition`，语言为 `zh-CN`。当前中文不强制本地模型，实际识别由 Edge 的远程服务完成，不调用本项目后端。
+
+**降级路径**：`gemini-3.5-transcribe-live`
+
+版本、构造器、安全上下文或运行时服务检查失败时，项目使用专用实时 STT 模型，通过 `input_audio_transcription` 接收增量和最终转录文本。
 
 ### 可配置参数：
-*   **`generation_config.speech_config` (双向专属音色)**
-    *   在 Live API 中，你需要让与你通话的 AI 拥有固定的人设音色。同样支持 `Aoede`, `Puck` 等。
+*   **`language_codes=["cmn-Hans-CN"]`**
+    *   固定为简体普通话，避免短句被自动语言检测误判为印地语或其他语言。
+*   **`mode="SMART"`**
+    *   清理口头填充词、重复和自我修正，并补充适当标点。
+*   **`custom_vocabulary`**
+    *   可添加业务专有名词以增强识别；建议仅加入真正容易误识别的词汇。
+*   **PCM 输入**
+    *   优先使用 16kHz、单声道、16-bit little-endian PCM，每约 100ms 发送一个分片。
+## Gemini 网络与代理配置
 
-*   **系统人设 (System Instruction) + 强制简短回复**
-    *   **作用**：在实时对话（打语音电话）中，如果 AI 一次性长篇大论，体验会极差。
-    *   **示例设置**：*"你是一个机智的口语陪练助手。你的回答必须极其简短，每次只用一两句话回应，像正常人类闲聊一样，不要列举条目。"*
-    
-*   **`tools` (函数调用 / Function Calling)**
-    *   **作用**：赋予实时语音助手“手”的能力。
-    *   **示例场景**：你可以告诉它获取天气的工具函数。当你对着麦克风说“今天北京天气怎样”，Live API 会触发后端的代码查天气，然后再用语音回答你。
+Google Gen AI SDK 默认读取系统及 `HTTP_PROXY`、`HTTPS_PROXY` 环境配置。交互式语音请求建议使用：
+
+- `GEMINI_HTTP_TIMEOUT_MS=30000`：单次请求超时。
+- `GEMINI_HTTP_RETRY_ATTEMPTS=3`：包含首次请求在内的尝试次数。
+- `GEMINI_TRUST_ENV=true`：允许 SDK 使用系统代理。
+- `GEMINI_PROXY=http://127.0.0.1:7890`：可选的固定代理地址；配置后优先使用该地址。
+
+若日志出现 `httpcore._sync.http_proxy` 和 `Server disconnected without sending a response`，说明断开发生在代理传输层，不是模型拒绝。应确认代理进程稳定，或在网络允许直连时设置 `GEMINI_TRUST_ENV=false`。
