@@ -29,3 +29,23 @@ def test_http_options_support_explicit_proxy(monkeypatch):
     expected = {"trust_env": False, "proxy": "http://127.0.0.1:7890"}
     assert options.client_args == expected
     assert options.async_client_args == expected
+
+
+def test_project_env_file_overrides_stale_process_key(monkeypatch, tmp_path):
+    """本地项目密钥应覆盖终端遗留值，确保 SDK 使用当前 backend/.env。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_API_KEY=current-project-key\n", encoding="utf-8")
+    monkeypatch.setenv("GEMINI_API_KEY", "stale-shell-key")
+
+    config.load_project_environment(env_file)
+
+    assert config.os.environ["GEMINI_API_KEY"] == "current-project-key"
+
+
+def test_missing_project_env_preserves_deployment_key(monkeypatch, tmp_path):
+    """容器没有 backend/.env 时应继续使用平台注入的环境变量。"""
+    monkeypatch.setenv("GEMINI_API_KEY", "deployment-key")
+
+    config.load_project_environment(tmp_path / "missing.env")
+
+    assert config.os.environ["GEMINI_API_KEY"] == "deployment-key"

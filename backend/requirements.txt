@@ -4,4 +4,5 @@ google-genai==2.20.0
 pydantic==2.13.4
 python-dotenv==1.2.3
 python-multipart==0.0.32
+python-socks==3.1.1
 uvicorn==0.52.4

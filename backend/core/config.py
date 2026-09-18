@@ -6,8 +6,16 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-# 始终读取 backend/.env，避免启动目录不同导致加载到错误配置。
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+PROJECT_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+
+
+def load_project_environment(env_file: Path = PROJECT_ENV_FILE) -> None:
+    """以项目 backend/.env 为准，避免终端遗留变量覆盖当前项目的 Gemini 凭证。"""
+    # 部署环境未提供该文件时不会改写现有环境变量，仍兼容容器/系统注入配置。
+    load_dotenv(env_file, override=env_file.is_file())
+
+
+load_project_environment()
 
 
 logger = logging.getLogger(__name__)

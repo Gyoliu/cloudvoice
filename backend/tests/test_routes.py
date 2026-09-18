@@ -4,16 +4,21 @@ from httpx import ASGITransport, AsyncClient
 from main import app
 from services.tts_service import GeneratedAudio, TTSService
 
+TEST_API_ACCESS_TOKEN = "test-api-token"
 
-def request(method: str, path: str, **kwargs):
+
+def request(method: str, path: str, *, auth: bool = True, **kwargs):
     """通过 HTTPX ASGI transport 调用 FastAPI，避免启动真实网络服务。"""
+    headers = dict(kwargs.pop("headers", {}) or {})
+    if auth:
+        headers.setdefault("Authorization", f"Bearer {TEST_API_ACCESS_TOKEN}")
 
     async def send_request():
         async with AsyncClient(
             transport=ASGITransport(app=app),
             base_url="http://testserver",
         ) as client:
-            return await client.request(method, path, **kwargs)
+            return await client.request(method, path, headers=headers, **kwargs)
 
     return asyncio.run(send_request())
 
@@ -103,3 +108,58 @@ def test_stt_upload_rejects_non_audio_file():
         files={"file": ("note.txt", b"not audio", "text/plain")},
     )
     assert response.status_code == 415
+
+
+def test_frontend_index_is_served_from_same_origin():
+    """同源部署时应由 FastAPI 直接提供前端首页。"""
+    response = request("GET", "/")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "Google Voice" in response.text
+
+
+def test_frontend_assets_are_served():
+    """前端静态资源应可从同一服务访问。"""
+    response = request("GET", "/app.js")
+    assert response.status_code == 200
+    assert "API_BASE" in response.text
+
+
+def test_api_rejects_missing_token():
+    """缺少 Token 的 /api 请求应返回 401。"""
+    response = request("POST", "/api/tts", auth=False, json={"text": "测试"})
+    assert response.status_code == 401
+    assert response.json()["detail"] == "未授权：请提供有效的 API Token"
+
+
+def test_api_rejects_invalid_token():
+    """错误 Token 应返回 401。"""
+    response = request(
+        "POST",
+        "/api/tts",
+        auth=False,
+        headers={"Authorization": "Bearer wrong-token"},
+        json={"text": "测试"},
+    )
+    assert response.status_code == 401
+
+
+def test_api_accepts_x_api_token_header(monkeypatch):
+    """兼容 X-API-Token 头。"""
+
+    async def generate_edge_audio(_text, _voice_name):
+        return GeneratedAudio(
+            content=b"mp3-audio",
+            media_type="audio/mpeg",
+            provider="microsoft-edge",
+        )
+
+    monkeypatch.setattr(TTSService, "generate_audio", generate_edge_audio)
+    response = request(
+        "POST",
+        "/api/tts",
+        auth=False,
+        headers={"X-API-Token": TEST_API_ACCESS_TOKEN},
+        json={"text": "测试"},
+    )
+    assert response.status_code == 200

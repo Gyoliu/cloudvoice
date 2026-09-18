@@ -5,11 +5,39 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <!-- 生产环境可填写后端源地址；留空时本地开发使用 8000 端口，部署时使用同源地址。 -->
     <meta name="google-voice-api-origin" content="">
+    <!-- 与 backend/.env 中 API_ACCESS_TOKEN 一致；也可在页面用「输入 Token 认证」写入 sessionStorage。 -->
+    <meta name="google-voice-api-token" content="">
     <title>Google Voice 平台</title>
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="style.css?v=auth-ui-4">
 </head>
 <body>
     <h1>Google Voice Web 平台</h1>
+
+    <section class="module auth-module" id="auth-section">
+        <div class="auth-header">
+            <div>
+                <h2>API 认证</h2>
+                <p class="auth-subtitle">调用后端接口前，请先完成 Token 认证</p>
+            </div>
+            <p id="auth-status" class="auth-status-badge">正在检查认证状态...</p>
+        </div>
+        <label class="auth-label" for="auth-token-input">访问 Token</label>
+        <div class="auth-form-row">
+            <div class="auth-input-wrap">
+                <input
+                    type="password"
+                    id="auth-token-input"
+                    placeholder="粘贴 API_ACCESS_TOKEN"
+                    autocomplete="off"
+                    spellcheck="false"
+                >
+            </div>
+            <div class="auth-actions">
+                <button type="button" id="btn-auth-set">确认认证</button>
+                <button type="button" id="btn-auth-clear" class="btn-secondary" disabled>清除认证</button>
+            </div>
+        </div>
+    </section>
 
     <div class="layout-container">
         <div class="left-panel">
@@ -52,6 +80,6 @@
         </div>
     </div>
 
-    <script src="app.js"></script>
+    <script src="app.js?v=auth-ui-4"></script>
 </body>
 </html>

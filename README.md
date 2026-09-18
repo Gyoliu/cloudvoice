@@ -26,50 +26,47 @@ googlecloudvoice/
 2. 确认无误后，分别在 `frontend` 和 `backend` 目录下进行代码实现。
 
 
-#### 1. 启动后端 (API 服务)
+#### 1. 启动服务（前端 + API 同源）
 
-  打开一个终端终端，进入 backend 目录：
+  打开一个终端，在项目根目录：
 
-    cd /Users/gyo/Downloads/googlecloudvoice/backend
+    cd /Users/gyo/Downloads/googlecloudvoice
+
+    # 激活虚拟环境（本仓库 .venv 由 uv 创建，默认无 pip）
+    source .venv/bin/activate
 
     # 如果你还没安装依赖，请先安装：
-    # python -m venv .venv
-    # source .venv/bin/activate
-    # 生产依赖（包含传递依赖哈希）
-    # pip install --require-hashes -r requirements.lock
+    # uv pip install --require-hashes -r ./backend/requirements.lock
+    # 或按 requirements.txt 安装（含 python-socks 等新增依赖）：
+    # uv pip install -r ./backend/requirements.txt
 
-    # 启动 FastAPI 后端服务
-    python main.py
+    # 启动 FastAPI（同时提供 /api 与 frontend 静态页面）
+    python ./backend/main.py
 
-  启动成功后，后端会在 http://0.0.0.0:8000 监听请求。
-  确保 `backend/.env` 文件中已经配置 `GEMINI_API_KEY`。该密钥用于 STT 和 TTS 的
-  Google 降级路径；TTS 首选 `zh-CN-YunxiNeural`，不需要额外的 Microsoft 凭据。
+  启动成功后，服务会在 http://0.0.0.0:8000 监听。
+  浏览器访问 👉 http://localhost:8000/
+
+  确保 `backend/.env` 已配置：
+  - `GEMINI_API_KEY`：STT / TTS Google 降级路径
+  - `API_ACCESS_TOKEN`：所有 `/api` 接口访问 Token
+
+  TTS 首选 `zh-CN-YunxiNeural`，不需要额外的 Microsoft 凭据。
   本项目使用 Gemini Developer API，不需要 `GOOGLE_APPLICATION_CREDENTIALS`。
 
-#### 2. 启动前端 (Web 界面)
+  前端可通过 `index.html` 的 `google-voice-api-token` meta 填写同一 Token；
+  留空时首次调用接口会弹窗输入，并写入 `sessionStorage`。
 
-  现代浏览器（尤其是 Chrome）为了安全，要求必须在 http/https 环境下才能调取麦克风，直接双击打开 .html (file://)
-  可能会导致无法授权麦克风权限。
+#### 2. 体验
 
-  所以，请再开一个新的终端，进入前端目录并启动一个极简的 Web 服务器：
-
-    cd /Users/gyo/Downloads/googlecloudvoice/frontend
-
-    # 使用 Python 自带的简易服务器启动前端
-    python -m http.server 3000
-
-  #### 3. 体验！
-
-  现在，在浏览器里访问 👉 http://localhost:3000
   你就可以体验普通 TTS、Edge TTS 边生成边播放、文件上传 STT 和实时麦克风转录。
   桌面版 Microsoft Edge 87 及以上且 SpeechRecognition 可用时，实时录音直接使用浏览器识别，
   不请求本项目后端；其他浏览器、旧版 Edge、策略禁用或运行时服务失败时，自动切换 WebSocket + PCM 路径。
   后端路径优先使用 AudioWorklet，缺少该能力时自动使用兼容采集方式。
 
-  如果前后端不是同源部署，可编辑 `frontend/index.html` 中的 `google-voice-api-origin` meta 配置；
-  HTTPS 页面会自动使用 `wss://` WebSocket。
+  同源部署时 `frontend/index.html` 中的 `google-voice-api-origin` 可留空。
+  若前后端分端口调试，可再单独起前端静态服务，并按需填写该 meta；HTTPS 页面会自动使用 `wss://` WebSocket。
 
-#### 4. 质量检查
+#### 3. 质量检查
 
     cd /Users/gyo/Downloads/googlecloudvoice
     pip install --require-hashes -r backend/requirements-dev.lock

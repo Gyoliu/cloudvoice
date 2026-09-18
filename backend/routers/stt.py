@@ -3,10 +3,12 @@ import json
 import logging
 import os
 import tempfile
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Annotated
 
 from core.audio import pcm_to_wav
+from core.auth import assert_websocket_api_token
 from core.config import clients
 from fastapi import APIRouter, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from google.genai import types
@@ -18,7 +20,16 @@ router = APIRouter()
 LIVE_MODEL = "gemini-3.5-transcribe-live"
 LIVE_LANGUAGE_CODE = "cmn-Hans-CN"
 LIVE_RECEIVE_TIMEOUT_SECONDS = 10
+LIVE_CONNECT_ATTEMPTS = 2
+LIVE_CONNECT_RETRY_DELAY_SECONDS = 0.25
 DEFAULT_SAMPLE_RATE = 16_000
+
+# Google Live API 可能用 HTTP 状态码或 WebSocket 关闭码包装认证错误，统一按消息识别。
+LIVE_AUTH_ERROR_MARKERS = (
+    "access_token_type_unsupported",
+    "invalid authentication credentials",
+    "unauthenticated",
+)
 
 # 支持上传给 Gemini 的音频 MIME 类型及其安全临时文件后缀。
 AUDIO_MIME_SUFFIXES = {
@@ -48,6 +59,28 @@ class StreamState:
     stop_received: bool = False
     # Live API 已确认的转录片段。
     final_segments: list[str] = field(default_factory=list)
+
+
+def classify_live_failure(exc: BaseException) -> str:
+    """将 Live API 异常归类，避免把预期连接故障记录为服务端代码异常。"""
+    exception_chain: list[BaseException] = []
+    visited: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        exception_chain.append(current)
+        current = current.__cause__ or current.__context__
+
+    for error in exception_chain:
+        error_message = str(error).lower()
+        if getattr(error, "code", None) == 401 or any(
+            marker in error_message for marker in LIVE_AUTH_ERROR_MARKERS
+        ):
+            return "authentication"
+
+    if any(isinstance(error, (ConnectionError, TimeoutError)) for error in exception_chain):
+        return "connection"
+    return "unexpected"
 
 
 def normalize_audio_mime_type(content_type: str | None) -> str:
@@ -99,6 +132,47 @@ def build_live_transcription_config() -> types.LiveConnectConfig:
             mode=types.AudioTranscriptionConfigMode.SMART,
         ),
     )
+
+
+@asynccontextmanager
+async def connect_live_with_retry(websocket: WebSocket, live_api, live_config):
+    """仅对 Live 握手阶段快速重试，避免瞬时断线退化为非实时批处理。"""
+    last_error: BaseException | None = None
+
+    for attempt in range(1, LIVE_CONNECT_ATTEMPTS + 1):
+        connected = False
+        try:
+            async with live_api.connect(model=LIVE_MODEL, config=live_config) as session:
+                connected = True
+                yield session
+                return
+        except Exception as exc:
+            # 已建立会话后的异常包含真实音频状态，交由外层无损降级，禁止重新进入上下文。
+            if connected:
+                raise
+
+            last_error = exc
+            failure_type = classify_live_failure(exc)
+            if failure_type not in {"authentication", "connection"}:
+                raise
+            if attempt >= LIVE_CONNECT_ATTEMPTS:
+                raise
+
+            logger.warning(
+                "Gemini Live API 首次握手失败，%dms 后快速重试（%s）",
+                round(LIVE_CONNECT_RETRY_DELAY_SECONDS * 1000),
+                type(exc).__name__,
+            )
+            await websocket.send_json(
+                {
+                    "is_final": False,
+                    "status": "Live API 首次连接失败，正在快速重试...",
+                }
+            )
+            await asyncio.sleep(LIVE_CONNECT_RETRY_DELAY_SECONDS)
+
+    # 循环边界由常量保证不会到达；保留防御性异常以避免静默退出上下文。
+    raise RuntimeError("Gemini Live API 连接重试异常结束") from last_error
 
 
 @router.post("/api/stt/upload")
@@ -299,6 +373,7 @@ async def run_live_transcription(
 
 @router.websocket("/api/stt/stream")
 async def speech_to_text_stream_route(websocket: WebSocket):
+    assert_websocket_api_token(websocket)
     await websocket.accept()
     audio_buffer = bytearray()
     state = StreamState()
@@ -316,7 +391,7 @@ async def speech_to_text_stream_route(websocket: WebSocket):
             return
 
         live_config = build_live_transcription_config()
-        async with live_api.connect(model=LIVE_MODEL, config=live_config) as session:
+        async with connect_live_with_retry(websocket, live_api, live_config) as session:
             await websocket.send_json(
                 {
                     "is_final": False,
@@ -330,8 +405,27 @@ async def speech_to_text_stream_route(websocket: WebSocket):
     except StreamProtocolError:
         logger.warning("实时转录协议错误", exc_info=True)
         await websocket.send_json({"is_final": True, "error": "实时转录协议错误"})
-    except Exception:
-        logger.exception("Live API 转录失败，切换到缓冲批处理模式")
+    except Exception as exc:
+        failure_type = classify_live_failure(exc)
+        if failure_type == "authentication":
+            # Live 与批处理共用 Gemini 凭证，认证失败后继续批处理只会再次失败。
+            logger.error("Gemini Live API 认证失败，已停止 STT 请求（%s）", type(exc).__name__)
+            await websocket.send_json(
+                {
+                    "is_final": True,
+                    "error": "Gemini 凭证无效，请更新 GEMINI_API_KEY 后重试",
+                }
+            )
+            return
+
+        if failure_type == "connection":
+            # 网络握手重置属于可恢复故障，不输出冗长堆栈，直接使用已保留的 PCM 缓冲。
+            logger.warning(
+                "Gemini Live API 连接中断，切换到缓冲批处理模式（%s）",
+                type(exc).__name__,
+            )
+        else:
+            logger.exception("Live API 转录失败，切换到缓冲批处理模式")
         await websocket.send_json(
             {
                 "is_final": False,

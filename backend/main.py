@@ -1,11 +1,16 @@
+from pathlib import Path
+
+from core.auth import ApiTokenMiddleware
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from routers import stt, tts
 
 # 初始化 FastAPI
 app = FastAPI(title="Google Voice API - MVC Architecture")
 
-# 配置 CORS
+# Token 先注册、CORS 后注册：后者在最外层，预检 OPTIONS 不会被 Token 拦截。
+app.add_middleware(ApiTokenMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,9 +19,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 挂载路由
+# 挂载 API 路由（须在静态目录之前注册，避免被 / 挂载抢占）
 app.include_router(tts.router, tags=["TTS"])
 app.include_router(stt.router, tags=["STT"])
+
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
 
 if __name__ == "__main__":
     import uvicorn

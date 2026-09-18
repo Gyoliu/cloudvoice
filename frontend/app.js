@@ -9,8 +9,62 @@ const API_BASE = `${configuredApiOrigin || defaultApiOrigin}/api`;
 const wsUrl = new URL(API_BASE);
 wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
 const WS_BASE = wsUrl.toString().replace(/\/$/, "");
+const apiTokenMeta = document.querySelector('meta[name="google-voice-api-token"]');
+const API_TOKEN_STORAGE_KEY = "google-voice-api-token";
 const STT_TARGET_SAMPLE_RATE = 16000;
 const MIN_EDGE_SPEECH_RECOGNITION_VERSION = 87;
+
+function getStoredApiToken() {
+    return sessionStorage.getItem(API_TOKEN_STORAGE_KEY)?.trim() || "";
+}
+
+function getMetaApiToken() {
+    return apiTokenMeta?.content.trim() || "";
+}
+
+function maskToken(token) {
+    if (token.length <= 8) {
+        return "*".repeat(Math.max(token.length, 4));
+    }
+    return `${token.slice(0, 4)}…${token.slice(-4)}`;
+}
+
+function resolveApiToken({ allowPrompt = true } = {}) {
+    const fromMeta = getMetaApiToken();
+    if (fromMeta) {
+        return fromMeta;
+    }
+    const fromSession = getStoredApiToken();
+    if (fromSession) {
+        return fromSession;
+    }
+    if (!allowPrompt) {
+        return "";
+    }
+    // 优先引导用户使用页面认证区，避免依赖可能被浏览器拦截的 window.prompt。
+    return "";
+}
+
+function requireApiToken() {
+    const token = resolveApiToken({ allowPrompt: false });
+    if (!token) {
+        throw new Error("缺少 API Token，请先在上方输入 Token 并点击「确认认证」");
+    }
+    return token;
+}
+
+function buildApiHeaders(extraHeaders = {}) {
+    return {
+        ...extraHeaders,
+        Authorization: `Bearer ${requireApiToken()}`,
+    };
+}
+
+function buildSttStreamUrl() {
+    const url = new URL(`${WS_BASE}/stt/stream`);
+    url.searchParams.set("token", requireApiToken());
+    return url.toString();
+}
 
 
 function detectEdgeSpeechRecognition() {
@@ -166,7 +220,7 @@ class PcmStreamRecorder {
 }
 
 
-document.addEventListener("DOMContentLoaded", () => {
+function bootApp() {
     class ActionLogger {
         constructor(actionName) {
             this.actionName = actionName;
@@ -225,6 +279,87 @@ document.addEventListener("DOMContentLoaded", () => {
         logsContainer.appendChild(logDiv);
         logsContainer.scrollTop = logsContainer.scrollHeight;
     }
+
+    const authStatus = document.getElementById("auth-status");
+    const authTokenInput = document.getElementById("auth-token-input");
+    const btnAuthSet = document.getElementById("btn-auth-set");
+    const btnAuthClear = document.getElementById("btn-auth-clear");
+
+    function refreshAuthStatus() {
+        if (!authStatus || !btnAuthClear) {
+            return;
+        }
+        const metaToken = getMetaApiToken();
+        const storedToken = getStoredApiToken();
+        authStatus.classList.remove("auth-ready", "auth-missing");
+
+        if (metaToken) {
+            authStatus.textContent = `已认证 · ${maskToken(metaToken)}`;
+            authStatus.classList.add("auth-ready");
+            btnAuthClear.disabled = true;
+            if (authTokenInput) {
+                authTokenInput.disabled = true;
+                authTokenInput.placeholder = "页面 meta 已配置 Token";
+            }
+            return;
+        }
+        if (storedToken) {
+            authStatus.textContent = `已认证 · ${maskToken(storedToken)}`;
+            authStatus.classList.add("auth-ready");
+            btnAuthClear.disabled = false;
+            if (authTokenInput) {
+                authTokenInput.disabled = false;
+                authTokenInput.value = "";
+                authTokenInput.placeholder = "已认证，更换请重新输入";
+            }
+            return;
+        }
+        authStatus.textContent = "未认证";
+        authStatus.classList.add("auth-missing");
+        btnAuthClear.disabled = true;
+        if (authTokenInput) {
+            authTokenInput.disabled = false;
+            authTokenInput.placeholder = "粘贴 API_ACCESS_TOKEN";
+        }
+    }
+
+    function saveTokenFromInput() {
+        if (getMetaApiToken()) {
+            addSystemLog("页面 meta 已配置 Token，优先使用该配置，无需写入 sessionStorage");
+            refreshAuthStatus();
+            return;
+        }
+        const entered = authTokenInput?.value.trim() || "";
+        if (!entered) {
+            addSystemLog("请先在输入框中填写 Token", true);
+            authTokenInput?.focus();
+            refreshAuthStatus();
+            return;
+        }
+        sessionStorage.setItem(API_TOKEN_STORAGE_KEY, entered);
+        authTokenInput.value = "";
+        addSystemLog("API Token 已写入 sessionStorage");
+        refreshAuthStatus();
+    }
+
+    btnAuthSet?.addEventListener("click", saveTokenFromInput);
+    authTokenInput?.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+            event.preventDefault();
+            saveTokenFromInput();
+        }
+    });
+
+    btnAuthClear?.addEventListener("click", () => {
+        sessionStorage.removeItem(API_TOKEN_STORAGE_KEY);
+        if (authTokenInput) {
+            authTokenInput.value = "";
+        }
+        addSystemLog("已清除 sessionStorage 中的 API Token");
+        refreshAuthStatus();
+    });
+
+    refreshAuthStatus();
 
     const btnTts = document.getElementById("btn-tts");
     const btnTtsStream = document.getElementById("btn-tts-stream");
@@ -327,7 +462,7 @@ document.addEventListener("DOMContentLoaded", () => {
             logger.updateStatus("正在调用后端接口...");
             const response = await fetch(`${API_BASE}/tts`, {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: buildApiHeaders({ "Content-Type": "application/json" }),
                 body: JSON.stringify({ text }),
             });
             if (!response.ok) {
@@ -374,7 +509,7 @@ document.addEventListener("DOMContentLoaded", () => {
             logger.updateStatus("正在等待首个音频分片...");
             const response = await fetch(`${API_BASE}/tts/stream`, {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: buildApiHeaders({ "Content-Type": "application/json" }),
                 body: JSON.stringify({ text }),
                 signal: streamController.signal,
             });
@@ -461,6 +596,7 @@ document.addEventListener("DOMContentLoaded", () => {
             logger.updateStatus("正在上传音频至云端...");
             const response = await fetch(`${API_BASE}/stt/upload`, {
                 method: "POST",
+                headers: buildApiHeaders(),
                 body: formData,
             });
             const responseBody = await response.json().catch(() => ({}));
@@ -572,7 +708,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         try {
             localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            const socket = new WebSocket(`${WS_BASE}/stt/stream`);
+            const socket = new WebSocket(buildSttStreamUrl());
             socket.binaryType = "arraybuffer";
             ws = socket;
 
@@ -858,4 +994,10 @@ document.addEventListener("DOMContentLoaded", () => {
         localStream?.getTracks().forEach((track) => track.stop());
         ws?.close();
     });
-});
+}
+
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", bootApp);
+} else {
+    bootApp();
+}

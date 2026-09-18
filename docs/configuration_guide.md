@@ -52,6 +52,12 @@
 
 **首选路径**：桌面 Microsoft Edge 87+ 的 `SpeechRecognition`，语言为 `zh-CN`。当前中文不强制本地模型，实际识别由 Edge 的远程服务完成，不调用本项目后端。
 
+浏览器类型和 `SpeechRecognition` 构造器在页面加载时同步检测；非桌面 Edge、版本过低或 API 不可用时，点击录音会直接建立后端 `/api/stt/stream` WebSocket，不等待浏览器识别超时。
+
+本地运行时以 `backend/.env` 为当前项目配置来源。若终端中残留另一个同名 `GEMINI_API_KEY`，项目文件中的值会覆盖它；部署环境没有 `backend/.env` 时，仍使用容器或系统注入的环境变量。
+
+务必配置 `API_ACCESS_TOKEN`。所有 `/api` HTTP 与 `/api/stt/stream` WebSocket 都要求携带同一 Token；未配置时接口返回 503。
+
 **降级路径**：`gemini-3.5-transcribe-live`
 
 版本、构造器、安全上下文或运行时服务检查失败时，项目使用专用实时 STT 模型，通过 `input_audio_transcription` 接收增量和最终转录文本。
@@ -73,5 +79,6 @@ Google Gen AI SDK 默认读取系统及 `HTTP_PROXY`、`HTTPS_PROXY` 环境配�
 - `GEMINI_HTTP_RETRY_ATTEMPTS=3`：包含首次请求在内的尝试次数。
 - `GEMINI_TRUST_ENV=true`：允许 SDK 使用系统代理。
 - `GEMINI_PROXY=http://127.0.0.1:7890`：可选的固定代理地址；配置后优先使用该地址。
+- `API_ACCESS_TOKEN=your-secret`：后端接口访问 Token。HTTP 使用 `Authorization: Bearer ...` 或 `X-API-Token`；WebSocket 使用 `?token=`。
 
 若日志出现 `httpcore._sync.http_proxy` 和 `Server disconnected without sending a response`，说明断开发生在代理传输层，不是模型拒绝。应确认代理进程稳定，或在网络允许直连时设置 `GEMINI_TRUST_ENV=false`。
