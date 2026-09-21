@@ -1,0 +1,27 @@
+[Unit]
+Description=Google Cloud Voice API
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# 如服务器使用其他部署账户，请同步修改 User、Group 和部署文档中的目录权限。
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/googlecloudvoice/current/backend
+EnvironmentFile=/opt/googlecloudvoice/shared/backend.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/googlecloudvoice/current/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+KillSignal=SIGINT
+UMask=0027
+
+# 基础进程隔离；应用仍可访问网络和系统临时目录。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

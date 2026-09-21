@@ -1,0 +1,143 @@
+name: CI and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Workflow 只需要读取仓库内容；生产密钥由远程服务器自行保管。
+permissions:
+  contents: read
+
+# 部署任务不互相取消，避免两次发布同时切换 current 软链接。
+concurrency:
+  group: googlecloudvoice-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Static checks and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.lock
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install locked Python dependencies
+        run: python -m pip install --require-hashes -r backend/requirements-dev.lock
+
+      - name: Run backend tests
+        run: pytest
+
+      - name: Run backend static checks
+        run: |
+          ruff check backend
+          python -m compileall -q backend
+
+      - name: Check frontend JavaScript syntax
+        run: |
+          node --check frontend/app.js
+          node --check frontend/pcm-recorder-worklet.js
+
+  deploy:
+    name: Deploy production
+    needs: test
+    # PR 只运行质量检查；只有 main 分支可以进入生产环境。
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/googlecloudvoice' }}
+      DEPLOY_ARCHIVE: ${{ runner.temp }}/googlecloudvoice-${{ github.sha }}.tar.gz
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate deployment settings
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ -n "$DEPLOY_HOST" ]] || { echo "DEPLOY_HOST is required" >&2; exit 1; }
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]] || { echo "DEPLOY_PORT must be numeric" >&2; exit 1; }
+          (( DEPLOY_PORT >= 1 && DEPLOY_PORT <= 65535 )) || { echo "DEPLOY_PORT is out of range" >&2; exit 1; }
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "DEPLOY_USER is invalid" >&2; exit 1; }
+          [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ ]] || { echo "DEPLOY_PATH must be a safe absolute path" >&2; exit 1; }
+          [[ -n "$DEPLOY_SSH_KEY" ]] || { echo "DEPLOY_SSH_KEY is required" >&2; exit 1; }
+          [[ -n "$DEPLOY_KNOWN_HOSTS" ]] || { echo "DEPLOY_KNOWN_HOSTS is required" >&2; exit 1; }
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+
+      - name: Build deployment archive
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tar \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.venv' \
+            --exclude='backend/.venv' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='backend/.env' \
+            --exclude='backend/.env.*' \
+            --exclude='__pycache__' \
+            --exclude='.pytest_cache' \
+            --exclude='.ruff_cache' \
+            --exclude='graphify-out' \
+            --exclude='.DS_Store' \
+            --exclude='patch_app.py' \
+            -czf "$DEPLOY_ARCHIVE" .
+
+      - name: Upload release archive
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          scp \
+            -i "$HOME/.ssh/id_ed25519" \
+            -P "$DEPLOY_PORT" \
+            -o BatchMode=yes \
+            "$DEPLOY_ARCHIVE" \
+            "$DEPLOY_USER@$DEPLOY_HOST:/tmp/googlecloudvoice-$GITHUB_SHA.tar.gz"
+
+      - name: Activate release on server
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ssh \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$DEPLOY_PORT" \
+            -o BatchMode=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "DEPLOY_ROOT='$DEPLOY_PATH' RELEASE_SHA='$GITHUB_SHA' ARCHIVE_PATH='/tmp/googlecloudvoice-$GITHUB_SHA.tar.gz' bash -s" \
+            < deploy/remote_deploy.sh
