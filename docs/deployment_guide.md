@@ -111,6 +111,88 @@ sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
 
 也可以把 `ssh-keyscan` 输出保存后执行 `ssh-keygen -lf 文件名`，两边指纹一致时，才将 `ssh-keyscan` 输出的完整一行保存到 `DEPLOY_KNOWN_HOSTS`。其中的主机名必须与 `DEPLOY_HOST` 完全一致：Workflow 使用 IP 连接就保存 IP 记录，使用域名连接就保存域名记录。
 
+### 5.1 两类 SSH 密钥的区别
+
+部署同时涉及服务器身份和登录用户身份，两者不可混用：
+
+| 配置或文件 | 作用 |
+| --- | --- |
+| `/etc/ssh/ssh_host_ed25519_key.pub` | 服务器自身的身份公钥，与登录账号无关 |
+| `DEPLOY_KNOWN_HOSTS` | GitHub 信任的服务器身份记录 |
+| `DEPLOY_SSH_KEY` | GitHub Actions 作为客户端登录的私钥 |
+| `/home/deploy/.ssh/authorized_keys` | 允许登录 `deploy` 用户的客户端公钥 |
+
+SSH 首先用 `DEPLOY_KNOWN_HOSTS` 验证服务器，再用 `DEPLOY_SSH_KEY` 登录 `deploy` 用户。因此 `REMOTE HOST IDENTIFICATION HAS CHANGED` 属于服务器身份不匹配，`Permission denied (publickey)` 属于登录密钥或账号配置错误。
+
+### 5.2 重新生成并配置 DEPLOY_KNOWN_HOSTS
+
+以下命令在本机执行，地址和端口必须与 `DEPLOY_HOST`、`DEPLOY_PORT` 完全一致：
+
+```bash
+server_host="替换为服务器IP或域名"
+ssh_port="22"
+known_hosts_file="/tmp/googlecloudvoice_known_hosts"
+
+ssh-keyscan -t ed25519 -p "$ssh_port" "$server_host" > "$known_hosts_file"
+ssh-keygen -lf "$known_hosts_file" -E sha256
+```
+
+通过云厂商控制台登录服务器，不依赖待验证的 SSH 连接，核对真实指纹：
+
+```bash
+sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256
+```
+
+两边 SHA256 指纹完全一致后，将下面命令输出的完整一行替换到 GitHub `production` Environment 的 `DEPLOY_KNOWN_HOSTS` Secret：
+
+```bash
+cat "$known_hosts_file"
+```
+
+不要删除或重新生成服务器的 `/etc/ssh/ssh_host_ed25519_key`。如果服务器重装、IP 重新分配或主机密钥确实更换，必须通过可信控制台重新核验，而不是关闭 `StrictHostKeyChecking`。
+
+### 5.3 排查 Permission denied (publickey)
+
+在本机从 `DEPLOY_SSH_KEY` 对应的私钥导出公钥并查看指纹：
+
+```bash
+ssh-keygen -y \
+  -f "$HOME/.ssh/googlecloudvoice_github_actions" \
+  > /tmp/googlecloudvoice_github_actions.pub
+ssh-keygen -lf /tmp/googlecloudvoice_github_actions.pub -E sha256
+```
+
+在服务器控制台检查 `deploy` 用户已授权公钥的指纹：
+
+```bash
+sudo ssh-keygen -lf /home/deploy/.ssh/authorized_keys -E sha256
+```
+
+两边必须存在相同指纹。如果不一致，把本机 `/tmp/googlecloudvoice_github_actions.pub` 的完整一行加入服务器的 `authorized_keys`，随后修复权限：
+
+```bash
+sudo chown deploy:deploy /home/deploy
+sudo chmod go-w /home/deploy
+sudo chown -R deploy:deploy /home/deploy/.ssh
+sudo chmod 700 /home/deploy/.ssh
+sudo chmod 600 /home/deploy/.ssh/authorized_keys
+```
+
+使用与 Workflow 相同的严格校验在本机测试；成功结果必须输出 `deploy`：
+
+```bash
+ssh \
+  -i "$HOME/.ssh/googlecloudvoice_github_actions" \
+  -p "$ssh_port" \
+  -o BatchMode=yes \
+  -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile="$known_hosts_file" \
+  "deploy@$server_host" \
+  "whoami"
+```
+
+最后确认 GitHub `DEPLOY_SSH_KEY` 保存的是无 `.pub` 后缀的完整私钥，`DEPLOY_USER` 是 `deploy`。私钥本机权限应为 `600`，服务器 `.ssh` 和 `authorized_keys` 权限分别为 `700`、`600`。
+
 添加以下 Environment Variable：
 
 | Variable | 说明 | 默认值 |
@@ -128,6 +210,103 @@ sudo systemctl status googlecloudvoice
 curl --fail http://127.0.0.1:8000/
 readlink -f /opt/googlecloudvoice/current
 ```
+
+### 6.1 手动重启并证明 8000 端口服务生效
+
+systemd 模板中的 `ExecStart` 明确让 Uvicorn 监听 `127.0.0.1:8000`。可记录重启前后的主进程 PID，再同时验证 systemd 状态、监听端口和 HTTP 响应：
+
+```bash
+before_pid="$(systemctl show --property=MainPID --value googlecloudvoice)"
+
+sudo systemctl restart googlecloudvoice
+
+after_pid="$(systemctl show --property=MainPID --value googlecloudvoice)"
+active_since="$(systemctl show --property=ActiveEnterTimestamp --value googlecloudvoice)"
+
+printf 'before_pid=%s\nafter_pid=%s\nactive_since=%s\n' \
+  "$before_pid" "$after_pid" "$active_since"
+
+systemctl is-active googlecloudvoice
+sudo ss -ltnp 'sport = :8000'
+curl --fail --silent --show-error http://127.0.0.1:8000/ >/dev/null \
+  && echo "HTTP health check passed on 127.0.0.1:8000"
+```
+
+有效证据应同时满足：
+
+1. `systemctl is-active` 输出 `active`；
+2. `after_pid` 是非零 PID，正常情况下与 `before_pid` 不同；
+3. `ss` 显示进程监听 `127.0.0.1:8000`；
+4. `curl` 输出健康检查通过。
+
+自动部署脚本也会执行同样的核心判断：服务必须是 `active` 且 `http://127.0.0.1:8000/` 返回成功，才会在 Workflow 日志输出重启前后 PID、服务启动时间和健康检查地址。失败时会自动回滚。
+
+若任一检查失败，查看服务日志：
+
+```bash
+sudo systemctl status googlecloudvoice
+sudo journalctl -u googlecloudvoice -n 100 --no-pager
+readlink -f /opt/googlecloudvoice/current
+```
+
+### 6.2 查看和管理服务日志
+
+生产服务使用 `backend/logging.json` 将业务日志、异常堆栈以及 Uvicorn 生命周期日志统一输出到 stdout，再由 systemd/journald 以 `googlecloudvoice` 标识收集。
+
+仓库中的 systemd 模板不会自动覆盖服务器 `/etc/systemd/system` 下的现有配置。首次启用本日志配置或模板发生变化后，需要在服务器重新安装并加载一次：
+
+```bash
+sudo install -m 644 \
+  /opt/googlecloudvoice/current/deploy/systemd/googlecloudvoice.service \
+  /etc/systemd/system/googlecloudvoice.service
+sudo systemctl daemon-reload
+sudo systemctl restart googlecloudvoice
+```
+
+然后查看最近 100 行：
+
+```bash
+sudo journalctl -u googlecloudvoice -n 100 --no-pager
+```
+
+实时跟踪日志：
+
+```bash
+sudo journalctl -u googlecloudvoice -f
+```
+
+查看本次系统启动以来的日志，或者只查看最近 30 分钟：
+
+```bash
+sudo journalctl -u googlecloudvoice -b --no-pager
+sudo journalctl -u googlecloudvoice --since "30 minutes ago" --no-pager
+```
+
+只查看 warning 及以上级别的异常日志：
+
+```bash
+sudo journalctl -u googlecloudvoice -p warning --no-pager
+```
+
+确认日志来自当前重启后的进程：
+
+```bash
+current_pid="$(systemctl show --property=MainPID --value googlecloudvoice)"
+active_since="$(systemctl show --property=ActiveEnterTimestamp --value googlecloudvoice)"
+
+printf 'pid=%s active_since=%s\n' "$current_pid" "$active_since"
+sudo journalctl -u googlecloudvoice --since "$active_since" --no-pager
+```
+
+应用会记录 TTS 提供方切换、Gemini 模型失败、STT Live API 降级、客户端断开和异常堆栈，但不会记录音频内容、TTS 原文、API Token 或请求头。Uvicorn 原始访问日志被显式关闭，因为 WebSocket 鉴权 Token 当前位于 URL 查询参数中，直接记录访问 URL 会泄露凭证。
+
+查看 journald 占用空间：
+
+```bash
+sudo journalctl --disk-usage
+```
+
+日志保留和磁盘上限由服务器 `/etc/systemd/journald.conf` 统一管理。生产环境应结合磁盘容量设置 `SystemMaxUse`、`SystemKeepFree` 和 `MaxRetentionSec`，修改后执行 `sudo systemctl restart systemd-journald`。
 
 健康检查失败时 Workflow 会自动回滚。需要人工回滚时，先确认目标版本目录，再原子替换软链接：
 

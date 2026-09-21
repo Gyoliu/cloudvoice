@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "formatters": {
+    "service": {
+      "format": "%(asctime)s %(levelname)s [%(process)d] [%(name)s] %(message)s",
+      "datefmt": "%Y-%m-%dT%H:%M:%S%z"
+    }
+  },
+  "handlers": {
+    "service": {
+      "class": "logging.StreamHandler",
+      "formatter": "service",
+      "stream": "ext://sys.stdout"
+    }
+  },
+  "root": {
+    "handlers": [
+      "service"
+    ],
+    "level": "INFO"
+  },
+  "loggers": {
+    "uvicorn": {
+      "handlers": [
+        "service"
+      ],
+      "level": "INFO",
+      "propagate": false
+    },
+    "uvicorn.error": {
+      "level": "INFO"
+    },
+    "uvicorn.access": {
+      "handlers": [
+        "service"
+      ],
+      "level": "CRITICAL",
+      "propagate": false
+    }
+  }
+}

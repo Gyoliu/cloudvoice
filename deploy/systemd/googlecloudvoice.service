@@ -11,12 +11,17 @@ Group=deploy
 WorkingDirectory=/opt/googlecloudvoice/current/backend
 EnvironmentFile=/opt/googlecloudvoice/shared/backend.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/googlecloudvoice/current/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1
+# 业务日志和 Uvicorn 生命周期日志统一写入 stdout，再由 journald 收集。
+# 禁用原始访问日志，避免 WebSocket 查询参数中的 API Token 进入日志。
+ExecStart=/opt/googlecloudvoice/current/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1 --log-config /opt/googlecloudvoice/current/backend/logging.json --no-access-log
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=20
 KillSignal=SIGINT
 UMask=0027
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=googlecloudvoice
 
 # 基础进程隔离；应用仍可访问网络和系统临时目录。
 NoNewPrivileges=true

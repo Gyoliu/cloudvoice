@@ -56,6 +56,7 @@ switch_current() {
 command -v python3 >/dev/null || fail "python3 is not installed"
 command -v curl >/dev/null || fail "curl is not installed"
 command -v sudo >/dev/null || fail "sudo is not installed"
+command -v systemctl >/dev/null || fail "systemctl is not installed"
 
 releases_dir="$DEPLOY_ROOT/releases"
 release_dir="$releases_dir/$RELEASE_SHA"
@@ -92,12 +93,18 @@ else
   echo "Release $RELEASE_SHA already exists; reusing it."
 fi
 
+previous_pid="$(systemctl show --property=MainPID --value "$SERVICE_NAME" 2>/dev/null || true)"
 switch_current "$release_dir"
 sudo systemctl restart "$SERVICE_NAME"
 
 for ((attempt = 1; attempt <= HEALTHCHECK_ATTEMPTS; attempt++)); do
-  if curl --fail --silent --show-error --max-time 2 "$HEALTHCHECK_URL" >/dev/null; then
+  if systemctl is-active --quiet "$SERVICE_NAME" \
+    && curl --fail --silent --show-error --max-time 2 "$HEALTHCHECK_URL" >/dev/null; then
+    current_pid="$(systemctl show --property=MainPID --value "$SERVICE_NAME")"
+    active_since="$(systemctl show --property=ActiveEnterTimestamp --value "$SERVICE_NAME")"
     echo "Release $RELEASE_SHA is healthy and active."
+    echo "Service restart verified: previous_pid=${previous_pid:-unknown}, current_pid=$current_pid"
+    echo "Service active since: $active_since; health endpoint: $HEALTHCHECK_URL"
     exit 0
   fi
   sleep "$HEALTHCHECK_INTERVAL_SECONDS"
