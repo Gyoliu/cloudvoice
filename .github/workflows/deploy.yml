@@ -71,7 +71,6 @@ jobs:
       DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
       DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
       DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/googlecloudvoice' }}
-      DEPLOY_ARCHIVE: ${{ runner.temp }}/googlecloudvoice-${{ github.sha }}.tar.gz
 
     steps:
       - name: Check out source
@@ -102,6 +101,9 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          # runner.temp 不能在作业级 env 中求值；步骤运行时使用 RUNNER_TEMP。
+          archive_path="$RUNNER_TEMP/googlecloudvoice-$GITHUB_SHA.tar.gz"
+          printf 'DEPLOY_ARCHIVE=%s\n' "$archive_path" >> "$GITHUB_ENV"
           tar \
             --exclude='.git' \
             --exclude='.github' \
@@ -117,7 +119,7 @@ jobs:
             --exclude='graphify-out' \
             --exclude='.DS_Store' \
             --exclude='patch_app.py' \
-            -czf "$DEPLOY_ARCHIVE" .
+            -czf "$archive_path" .
 
       - name: Upload release archive
         shell: bash
