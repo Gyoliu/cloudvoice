@@ -97,6 +97,20 @@ WebSocket 当前通过 URL 查询参数传递令牌，因此 Nginx 模板对 `/a
 
 如果 SSH 使用非 `22` 端口，`DEPLOY_KNOWN_HOSTS` 中的主机名必须使用 `[域名或IP]:端口` 格式。
 
+可先在本机获取待核验的记录（替换地址和端口）：
+
+```bash
+ssh-keyscan -t ed25519 -p 22 服务器地址
+```
+
+再通过服务器控制台核对真实指纹：
+
+```bash
+sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+```
+
+也可以把 `ssh-keyscan` 输出保存后执行 `ssh-keygen -lf 文件名`，两边指纹一致时，才将 `ssh-keyscan` 输出的完整一行保存到 `DEPLOY_KNOWN_HOSTS`。其中的主机名必须与 `DEPLOY_HOST` 完全一致：Workflow 使用 IP 连接就保存 IP 记录，使用域名连接就保存域名记录。
+
 添加以下 Environment Variable：
 
 | Variable | 说明 | 默认值 |
