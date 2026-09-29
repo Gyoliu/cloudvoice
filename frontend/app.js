@@ -220,6 +220,177 @@ class PcmStreamRecorder {
 }
 
 
+class WavPcmStreamPlayer {
+    constructor(audioContext, signal, onPlaybackStarted) {
+        this.audioContext = audioContext;
+        this.signal = signal;
+        this.onPlaybackStarted = onPlaybackStarted;
+        this.pendingBytes = new Uint8Array(0);
+        this.headerParsed = false;
+        this.audioFormat = null;
+        this.channelCount = null;
+        this.sampleRate = null;
+        this.bitsPerSample = null;
+        this.blockAlign = null;
+        this.nextStartTime = 0;
+        this.playbackStarted = false;
+        this.activeSources = new Set();
+    }
+
+    appendBytes(chunk) {
+        const merged = new Uint8Array(this.pendingBytes.length + chunk.byteLength);
+        merged.set(this.pendingBytes, 0);
+        merged.set(chunk, this.pendingBytes.length);
+        this.pendingBytes = merged;
+    }
+
+    readAscii(offset, length) {
+        return String.fromCharCode(...this.pendingBytes.slice(offset, offset + length));
+    }
+
+    parseHeader() {
+        if (this.pendingBytes.length < 12) return false;
+        if (this.readAscii(0, 4) !== "RIFF" || this.readAscii(8, 4) !== "WAVE") {
+            throw new Error("流式接口返回的 WAV 文件头无效");
+        }
+
+        let offset = 12;
+        let formatFound = false;
+        while (this.pendingBytes.length >= offset + 8) {
+            const chunkId = this.readAscii(offset, 4);
+            const chunkView = new DataView(
+                this.pendingBytes.buffer,
+                this.pendingBytes.byteOffset + offset,
+            );
+            const chunkSize = chunkView.getUint32(4, true);
+            const payloadOffset = offset + 8;
+
+            if (chunkId === "fmt ") {
+                if (this.pendingBytes.length < payloadOffset + chunkSize) return false;
+                if (chunkSize < 16) throw new Error("WAV fmt 分块长度无效");
+                const formatView = new DataView(
+                    this.pendingBytes.buffer,
+                    this.pendingBytes.byteOffset + payloadOffset,
+                    chunkSize,
+                );
+                this.audioFormat = formatView.getUint16(0, true);
+                this.channelCount = formatView.getUint16(2, true);
+                this.sampleRate = formatView.getUint32(4, true);
+                this.blockAlign = formatView.getUint16(12, true);
+                this.bitsPerSample = formatView.getUint16(14, true);
+                formatFound = true;
+            } else if (chunkId === "data") {
+                if (!formatFound) throw new Error("WAV 文件缺少 fmt 分块");
+                if (
+                    this.audioFormat !== 1
+                    || this.bitsPerSample !== 16
+                    || !this.channelCount
+                    || !this.sampleRate
+                    || !this.blockAlign
+                ) {
+                    throw new Error("当前仅支持 16 位 PCM WAV 流式播放");
+                }
+                this.pendingBytes = this.pendingBytes.slice(payloadOffset);
+                this.headerParsed = true;
+                return true;
+            }
+
+            const paddedChunkSize = chunkSize + (chunkSize % 2);
+            if (this.pendingBytes.length < payloadOffset + paddedChunkSize) return false;
+            offset = payloadOffset + paddedChunkSize;
+        }
+        return false;
+    }
+
+    schedulePendingFrames() {
+        if (!this.headerParsed || !this.blockAlign) return;
+        const playableLength = this.pendingBytes.length
+            - (this.pendingBytes.length % this.blockAlign);
+        if (!playableLength) return;
+
+        const pcmBytes = this.pendingBytes.slice(0, playableLength);
+        this.pendingBytes = this.pendingBytes.slice(playableLength);
+        const frameCount = playableLength / this.blockAlign;
+        const audioBuffer = this.audioContext.createBuffer(
+            this.channelCount,
+            frameCount,
+            this.sampleRate,
+        );
+        const pcmView = new DataView(
+            pcmBytes.buffer,
+            pcmBytes.byteOffset,
+            pcmBytes.byteLength,
+        );
+
+        for (let channel = 0; channel < this.channelCount; channel += 1) {
+            const output = audioBuffer.getChannelData(channel);
+            for (let frame = 0; frame < frameCount; frame += 1) {
+                const byteOffset = frame * this.blockAlign + channel * 2;
+                output[frame] = pcmView.getInt16(byteOffset, true) / 32768;
+            }
+        }
+
+        const source = this.audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(this.audioContext.destination);
+        const startAt = Math.max(this.nextStartTime, this.audioContext.currentTime + 0.03);
+        source.start(startAt);
+        this.nextStartTime = startAt + audioBuffer.duration;
+        this.activeSources.add(source);
+        source.addEventListener("ended", () => this.activeSources.delete(source), { once: true });
+
+        if (!this.playbackStarted) {
+            this.playbackStarted = true;
+            this.onPlaybackStarted();
+        }
+    }
+
+    write(chunk) {
+        if (this.signal.aborted) throw new DOMException("流式播放已停止", "AbortError");
+        this.appendBytes(chunk);
+        if (!this.headerParsed && !this.parseHeader()) return;
+        this.schedulePendingFrames();
+    }
+
+    async finish() {
+        if (!this.playbackStarted) throw new Error("TTS 未返回可播放音频");
+        const remainingSeconds = Math.max(0, this.nextStartTime - this.audioContext.currentTime);
+        if (remainingSeconds > 0) {
+            await new Promise((resolve, reject) => {
+                const cleanup = () => this.signal.removeEventListener("abort", handleAbort);
+                const handleComplete = () => {
+                    cleanup();
+                    resolve();
+                };
+                const timer = window.setTimeout(
+                    handleComplete,
+                    remainingSeconds * 1000 + 100,
+                );
+                const handleAbort = () => {
+                    window.clearTimeout(timer);
+                    cleanup();
+                    reject(new DOMException("流式播放已停止", "AbortError"));
+                };
+                this.signal.addEventListener("abort", handleAbort, { once: true });
+            });
+        }
+        if (this.audioContext.state !== "closed") await this.audioContext.close();
+    }
+
+    stop() {
+        this.activeSources.forEach((source) => {
+            try {
+                source.stop();
+            } catch (_error) {
+                // 音频节点可能已自然结束；停止操作保持幂等。
+            }
+        });
+        this.activeSources.clear();
+        if (this.audioContext.state !== "closed") void this.audioContext.close();
+    }
+}
+
+
 function bootApp() {
     class ActionLogger {
         constructor(actionName) {
@@ -369,10 +540,13 @@ function bootApp() {
     let currentTtsStreamUrl = null;
     let currentTtsStreamController = null;
     let currentTtsMediaSource = null;
+    let currentTtsPcmPlayer = null;
 
     function resetTtsPlayer() {
         currentTtsStreamController?.abort();
         currentTtsStreamController = null;
+        currentTtsPcmPlayer?.stop();
+        currentTtsPcmPlayer = null;
         ttsAudio.pause();
         ttsAudio.removeAttribute("src");
         ttsAudio.load();
@@ -426,7 +600,7 @@ function bootApp() {
             };
             const handleError = () => {
                 cleanup();
-                reject(new Error("浏览器无法解码 Edge TTS 音频分片"));
+                reject(new Error("浏览器无法解码 MP3 音频分片"));
             };
             const handleAbort = () => {
                 cleanup();
@@ -491,19 +665,17 @@ function bootApp() {
             addSystemLog("请输入需要转为语音的文字", true);
             return;
         }
-        if (!window.MediaSource || !MediaSource.isTypeSupported("audio/mpeg")) {
-            addSystemLog("当前浏览器不支持 MP3 流式播放，请使用 Chrome 或 Edge", true);
-            return;
-        }
-
-        const logger = new ActionLogger("Edge TTS 流式播放");
+        const logger = new ActionLogger("TTS 流式播放");
         resetTtsPlayer();
         const streamController = new AbortController();
         currentTtsStreamController = streamController;
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        let reservedAudioContext = AudioContextClass ? new AudioContextClass() : null;
+        if (reservedAudioContext) await reservedAudioContext.resume();
         btnTts.disabled = true;
         btnTtsStream.disabled = true;
         btnTtsStreamStop.disabled = false;
-        btnTtsStream.innerText = "正在连接 Edge...";
+        btnTtsStream.innerText = "正在连接...";
 
         try {
             logger.updateStatus("正在等待首个音频分片...");
@@ -518,55 +690,92 @@ function bootApp() {
                 throw new Error(errorBody.detail || `HTTP ${response.status}`);
             }
             if (!response.body) throw new Error("浏览器未提供流式响应读取能力");
-
-            currentTtsMediaSource = new MediaSource();
-            currentTtsStreamUrl = URL.createObjectURL(currentTtsMediaSource);
-            ttsAudio.src = currentTtsStreamUrl;
-            ttsAudio.style.display = "block";
-            await waitForMediaSourceOpen(currentTtsMediaSource, streamController.signal);
-
-            const sourceBuffer = currentTtsMediaSource.addSourceBuffer("audio/mpeg");
+            const mediaType = (response.headers.get("Content-Type") || "")
+                .split(";", 1)[0]
+                .trim()
+                .toLowerCase();
+            const provider = response.headers.get("X-TTS-Provider") || "未知提供方";
             const reader = response.body.getReader();
             let playbackStarted = false;
+
+            if (mediaType === "audio/wav") {
+                if (!reservedAudioContext) {
+                    throw new Error("当前浏览器不支持 Web Audio WAV 流式播放");
+                }
+                currentTtsPcmPlayer = new WavPcmStreamPlayer(
+                    reservedAudioContext,
+                    streamController.signal,
+                    () => {
+                        playbackStarted = true;
+                        logger.updateStatus(`已开始播放，正在接收 ${provider} 音频分片...`);
+                    },
+                );
+                reservedAudioContext = null;
+            } else if (mediaType === "audio/mpeg") {
+                if (!window.MediaSource || !MediaSource.isTypeSupported("audio/mpeg")) {
+                    throw new Error("当前浏览器不支持 MP3 流式播放");
+                }
+                if (reservedAudioContext?.state !== "closed") {
+                    await reservedAudioContext?.close();
+                }
+                reservedAudioContext = null;
+                currentTtsMediaSource = new MediaSource();
+                currentTtsStreamUrl = URL.createObjectURL(currentTtsMediaSource);
+                ttsAudio.src = currentTtsStreamUrl;
+                ttsAudio.style.display = "block";
+                await waitForMediaSourceOpen(currentTtsMediaSource, streamController.signal);
+            } else {
+                throw new Error(`流式接口返回了不支持的音频格式: ${mediaType || "未知"}`);
+            }
+
+            const sourceBuffer = currentTtsMediaSource?.addSourceBuffer("audio/mpeg");
 
             while (true) {
                 const { value, done } = await reader.read();
                 if (done) break;
                 if (!value?.byteLength) continue;
 
-                await appendAudioChunk(sourceBuffer, value, streamController.signal);
-                if (!playbackStarted) {
+                if (currentTtsPcmPlayer) {
+                    currentTtsPcmPlayer.write(value);
+                } else {
+                    await appendAudioChunk(sourceBuffer, value, streamController.signal);
+                }
+                if (!currentTtsPcmPlayer && !playbackStarted) {
                     playbackStarted = true;
                     await ttsAudio.play();
-                    logger.updateStatus("已开始播放，正在接收后续音频分片...");
+                    logger.updateStatus(`已开始播放，正在接收 ${provider} 音频分片...`);
                 }
             }
 
-            if (!playbackStarted) throw new Error("Edge TTS 未返回可播放音频");
-            if (currentTtsMediaSource.readyState === "open") {
+            if (currentTtsPcmPlayer) {
+                await currentTtsPcmPlayer.finish();
+            } else if (currentTtsMediaSource?.readyState === "open") {
+                if (!playbackStarted) throw new Error("TTS 未返回可播放音频");
                 currentTtsMediaSource.endOfStream();
             }
-            logger.finish("✅ Edge TTS 音频已流式接收并播放。");
+            logger.finish(`✅ ${provider} 音频已流式接收并播放。`);
+            btnTtsStreamStop.disabled = true;
         } catch (error) {
             if (error.name === "AbortError") {
-                logger.finish("⏹ Edge TTS 流式播放已停止。");
+                logger.finish("⏹ TTS 流式播放已停止。");
             } else {
                 resetTtsPlayer();
-                logger.finish(`❌ Edge TTS 流式播放失败: ${error.message}`, true);
+                logger.finish(`❌ TTS 流式播放失败: ${error.message}`, true);
             }
         } finally {
+            if (reservedAudioContext?.state !== "closed") void reservedAudioContext?.close();
             if (currentTtsStreamController === streamController) {
                 currentTtsStreamController = null;
             }
             btnTts.disabled = false;
             btnTtsStream.disabled = false;
-            btnTtsStream.innerText = "Edge 流式播放";
+            btnTtsStream.innerText = "流式播放";
         }
     });
 
     btnTtsStreamStop.addEventListener("click", () => {
         resetTtsPlayer();
-        addSystemLog("Edge TTS 流式播放已停止");
+        addSystemLog("TTS 流式播放已停止");
     });
 
     ttsAudio.addEventListener("ended", () => {
@@ -586,14 +795,14 @@ function bootApp() {
         const logger = new ActionLogger("语音转文字 (文件上传)");
         btnUpload.disabled = true;
         btnUpload.innerText = "云端识别中...";
-        resultUpload.innerText = "正在上传并等待 Gemini 处理...";
+        resultUpload.innerText = "正在上传并等待语音识别服务处理...";
         resultUpload.style.color = "#ff9800";
 
         const formData = new FormData();
         formData.append("file", fileInput.files[0]);
 
         try {
-            logger.updateStatus("正在上传音频至云端...");
+            logger.updateStatus("正在上传音频至语音识别服务...");
             const response = await fetch(`${API_BASE}/stt/upload`, {
                 method: "POST",
                 headers: buildApiHeaders(),

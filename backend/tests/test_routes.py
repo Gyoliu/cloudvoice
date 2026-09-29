@@ -1,8 +1,10 @@
 import asyncio
+import json
+import logging
 
 from httpx import ASGITransport, AsyncClient
 from main import app
-from services.tts_service import GeneratedAudio, TTSService
+from services.tts_service import GeneratedAudio, StartedAudioStream, TTSService
 
 TEST_API_ACCESS_TOKEN = "test-api-token"
 
@@ -43,7 +45,7 @@ def test_tts_hides_internal_service_error(monkeypatch):
     assert "sensitive upstream detail" not in response.text
 
 
-def test_tts_uses_generated_audio_media_type_and_provider(monkeypatch):
+def test_tts_uses_generated_audio_media_type_and_provider(monkeypatch, caplog):
     """TTS 路由应返回实际编码类型，并标识最终使用的提供方。"""
 
     async def generate_edge_audio(_text, _voice_name):
@@ -54,26 +56,56 @@ def test_tts_uses_generated_audio_media_type_and_provider(monkeypatch):
         )
 
     monkeypatch.setattr(TTSService, "generate_audio", generate_edge_audio)
+    caplog.set_level(logging.INFO, logger="request.observability")
     response = request("POST", "/api/tts", json={"text": "测试"})
 
     assert response.status_code == 200
     assert response.content == b"mp3-audio"
     assert response.headers["content-type"] == "audio/mpeg"
     assert response.headers["x-tts-provider"] == "microsoft-edge"
+    assert response.headers["x-request-id"]
+
+    request_logs = [
+        json.loads(record.getMessage().removeprefix("API_REQUEST "))
+        for record in caplog.records
+        if record.name == "request.observability"
+    ]
+    assert [payload["event"] for payload in request_logs] == ["request", "response"]
+    assert {payload["request_id"] for payload in request_logs} == {
+        response.headers["x-request-id"]
+    }
+    assert request_logs[1]["status"] == 200
+    assert "测试" not in " ".join(record.getMessage() for record in caplog.records)
 
 
-def test_edge_tts_stream_returns_mp3_chunks_without_fallback(monkeypatch):
-    """流式接口应仅透传 Edge MP3 分片，并明确禁止代理缓冲。"""
+def test_request_log_covers_authentication_failure(caplog):
+    """最外层请求日志应覆盖未授权请求，但不记录 Token。"""
+    caplog.set_level(logging.INFO, logger="request.observability")
+    response = request("POST", "/api/tts", auth=False, json={"text": "测试"})
 
-    async def generate_stream(_text):
-        yield b"mp3-first"
+    assert response.status_code == 401
+    assert response.headers["x-request-id"]
+    combined_logs = " ".join(record.getMessage() for record in caplog.records)
+    assert "API_REQUEST" in combined_logs
+    assert TEST_API_ACCESS_TOKEN not in combined_logs
+    assert "测试" not in combined_logs
+
+
+def test_tts_stream_returns_started_provider_chunks(monkeypatch):
+    """流式接口应透传服务层已启动的音频流及其真实响应元数据。"""
+
+    async def remaining_stream():
         yield b"mp3-second"
 
-    async def unexpected_fallback(_text, _voice_name):
-        raise AssertionError("流式接口不应调用普通 TTS 降级链路")
+    async def start_stream(_text):
+        return StartedAudioStream(
+            first_chunk=b"mp3-first",
+            stream=remaining_stream(),
+            media_type="audio/mpeg",
+            provider="microsoft-edge",
+        )
 
-    monkeypatch.setattr(TTSService, "stream_edge_audio", generate_stream)
-    monkeypatch.setattr(TTSService, "generate_audio", unexpected_fallback)
+    monkeypatch.setattr(TTSService, "start_audio_stream", start_stream)
     response = request("POST", "/api/tts/stream", json={"text": "测试"})
 
     assert response.status_code == 200
@@ -84,20 +116,18 @@ def test_edge_tts_stream_returns_mp3_chunks_without_fallback(monkeypatch):
     assert response.headers["cache-control"] == "no-store"
 
 
-def test_edge_tts_stream_returns_502_before_first_chunk(monkeypatch):
-    """Edge 在首个分片前失败时应返回通用错误且不尝试 Google。"""
+def test_tts_stream_returns_502_before_first_chunk(monkeypatch):
+    """全部流式提供方在首个分片前失败时应返回通用错误。"""
 
     async def fail_before_first_chunk(_text):
-        if False:
-            yield b"unreachable"
-        raise ConnectionError("sensitive edge detail")
+        raise ConnectionError("sensitive upstream detail")
 
-    monkeypatch.setattr(TTSService, "stream_edge_audio", fail_before_first_chunk)
+    monkeypatch.setattr(TTSService, "start_audio_stream", fail_before_first_chunk)
     response = request("POST", "/api/tts/stream", json={"text": "测试"})
 
     assert response.status_code == 502
-    assert response.json() == {"detail": "Edge 流式语音服务暂时不可用"}
-    assert "sensitive edge detail" not in response.text
+    assert response.json() == {"detail": "流式语音服务暂时不可用"}
+    assert "sensitive upstream detail" not in response.text
 
 
 def test_stt_upload_rejects_non_audio_file():

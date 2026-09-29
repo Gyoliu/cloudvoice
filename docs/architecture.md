@@ -1,57 +1,48 @@
-# 系统架构设计（Edge TTS + Gemini 降级架构）
+# 系统架构设计（启动时固定提供方模式）
 
-## 1. 整体架构图
+## 1. 设计结论
+
+应用通过 `AI_PROVIDER_MODE` 在进程启动时选择一种后端语音提供方模式：
+
+| 模式 | 普通 TTS | 流式 TTS | 批量/缓冲 STT |
+|---|---|---|---|
+| `original`（默认） | Microsoft Edge → Google Gemini SDK | Microsoft Edge | Gemini SDK：`3.6-flash` → `3.5-flash` |
+| `aggregator` | LLM 聚合平台 | LLM 聚合平台 | LLM 聚合平台 |
+
+两种模式互斥。聚合平台请求失败不会自动切换到 Edge 或 Gemini，原有模式失败也不会切换到聚合平台。`original` 是默认值，用于优先保持原有稳定性。
+
+实时 STT 是例外：聚合平台目前没有实时增量转录协议，因此浏览器仍优先使用 Edge `SpeechRecognition`，后端仍使用 Gemini Live。Gemini Live 失败后，完整 PCM 缓冲才交给启动时选定的批量 STT 模式。
+
+## 2. 整体架构图
 
 ```mermaid
-graph LR
-    subgraph Web Frontend (Vanilla HTML+JS)
-        UI_TTS[文字转语音模块]
-        UI_STT_Upload[音频文件上传模块]
-        UI_STT_Realtime[麦克风实时录音模块]
-    end
+flowchart LR
+    START["应用启动"] --> MODE{"AI_PROVIDER_MODE"}
 
-    subgraph Backend API (FastAPI)
-        API_TTS[HTTP POST /api/tts]
-        API_TTS_Stream[HTTP POST /api/tts/stream]
-        API_Upload[HTTP POST /api/stt/upload]
-        API_WS[WebSocket /api/stt/stream]
-    end
+    MODE -->|"original（默认）"| ORIGINAL["原有稳定模式"]
+    MODE -->|"aggregator"| AGGREGATOR["聚合平台模式"]
 
-    subgraph Microsoft Edge Speech
-        TTS_Primary[edge-tts / zh-CN-YunxiNeural]
-        STT_Browser[SpeechRecognition / zh-CN]
-    end
+    ORIGINAL --> OTTS["普通 TTS：Edge → Gemini"]
+    ORIGINAL --> OSTREAM["流式 TTS：Edge"]
+    ORIGINAL --> OSTT["批量 STT：Gemini 3.6 → 3.5"]
 
-    subgraph Google AI Studio
-        TTS_Fallback[Gemini TTS 模型组]
-        STT_Primary[gemini-3.6-flash]
-        STT_Fallback[gemini-3.5-flash]
-        STT_Live[gemini-3.5-transcribe-live / cmn-Hans-CN]
-    end
+    AGGREGATOR --> ATTS["普通 TTS：/v1/audio/speech"]
+    AGGREGATOR --> ASTREAM["流式 TTS：/v1/audio/speech"]
+    AGGREGATOR --> ASTT["批量 STT：/v1/audio/transcriptions"]
 
-    UI_TTS -- 发送文本 JSON --> API_TTS
-    UI_TTS -- Edge-only 流式播放 --> API_TTS_Stream
-    API_TTS -- 首选生成 MP3 --> TTS_Primary
-    API_TTS -- Edge 失败后生成 WAV --> TTS_Fallback
-    TTS_Primary & TTS_Fallback --> API_TTS
-    API_TTS_Stream -- MP3 分片直接透传，不降级 --> TTS_Primary
-    TTS_Primary -- HTTP 分块响应 --> API_TTS_Stream
-    
-    UI_STT_Upload -- 提交音频文件 FormData --> API_Upload
-    API_Upload -- 首选失败则降级 --> STT_Primary & STT_Fallback
-    STT_Primary & STT_Fallback -- 返回文本转录结果 --> API_Upload
-    
-    UI_STT_Realtime -- 桌面 Edge 87+ 且运行可用，不调用项目接口 --> STT_Browser
-    UI_STT_Realtime -- 不支持、策略禁用或运行失败 --> API_WS
-    UI_STT_Realtime -- 后端路径持续发送 16-bit PCM 分片 --> API_WS
-    API_WS -- 简体普通话实时转录 --> STT_Live
-    API_WS -- Live API 失败则将 PCM 缓冲封装 WAV --> STT_Primary & STT_Fallback
+    ATTS -. "失败直接返回 502" .-> ERR["不跨模式切换"]
+    ASTREAM -. "失败直接返回 502" .-> ERR
+    ASTT -. "失败直接返回 502" .-> ERR
+
+    BROWSER["桌面 Edge SpeechRecognition"] -->|"不可用"| LIVE["Gemini Live 实时 STT"]
+    LIVE -->|"失败后使用完整 PCM 缓冲"| MODE
 ```
 
-## 2. 方案优势
+## 3. 设计原则
 
-1. **TTS 响应更快**：日常文字合成优先走 Edge TTS，固定使用 `zh-CN-YunxiNeural` 中文男声，并直接返回 MP3。
-2. **自动容错**：Edge TTS 连接、接收或音频解析失败时，后端自动切换到 Gemini TTS 模型组并返回 WAV。
-3. **接口兼容**：前端仍使用同一个 `/api/tts` 接口和 Blob 播放逻辑，无需关心实际音频提供方。
-4. **低首播延迟**：`/api/tts/stream` 将 Edge TTS 的 MP3 分片直接交给浏览器 MediaSource，在完整语音生成前即可开始播放。
-5. **减少后端 STT 调用**：可用的桌面 Edge 直接通过浏览器 SpeechRecognition 识别；版本、能力与运行时三层检查失败后才启用现有 WebSocket 链路。
+1. **启动时确定**：模式在配置加载时解析并锁定，修改环境变量后必须重启应用。
+2. **默认稳定**：未配置时选择 `original`，继续使用原有 Edge/Gemini 逻辑。
+3. **禁止跨模式熔断**：请求级异常只在当前模式内处理，绝不改变进程提供方选择。
+4. **保留原有内部降级**：`original` 模式中的 Edge → Gemini 和 Gemini 主备模型属于原有稳定链，不是聚合平台熔断。
+5. **启动校验**：选择 `aggregator` 时，缺少平台 URL 或 Key 会阻止应用成功启动。
+6. **真实格式识别**：聚合平台音频仍按文件魔数识别 WAV/MP3，避免错误的上游 `Content-Type`。

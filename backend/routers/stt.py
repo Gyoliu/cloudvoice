@@ -7,10 +7,26 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Annotated
 
+from core.ai_observability import (
+    AICallObservation,
+    RequestObservation,
+    binary_content,
+    bind_request_id,
+    reset_request_id,
+    text_content,
+)
 from core.audio import pcm_to_wav
 from core.auth import assert_websocket_api_token
-from core.config import clients
-from fastapi import APIRouter, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from core.config import AI_PROVIDER_MODE, AIProviderMode, clients
+from fastapi import (
+    APIRouter,
+    File,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    WebSocketException,
+)
 from google.genai import types
 from services.stt_service import STTService
 
@@ -59,6 +75,8 @@ class StreamState:
     stop_received: bool = False
     # Live API 已确认的转录片段。
     final_segments: list[str] = field(default_factory=list)
+    # 当前 Gemini Live 调用的观测上下文；只记录文本，不记录 PCM 二进制。
+    ai_observation: AICallObservation | None = None
 
 
 def classify_live_failure(exc: BaseException) -> str:
@@ -189,8 +207,7 @@ async def speech_to_text_upload_route(file: Annotated[UploadFile, File()]):
             tmp.write(content)
             tmp_path = tmp.name
 
-        # Gemini SDK 是同步接口，放入工作线程，避免阻塞 FastAPI 事件循环。
-        text = await asyncio.to_thread(STTService.transcribe_file, tmp_path, mime_type)
+        text = await STTService.transcribe_file(tmp_path, mime_type)
         return {"status": "success", "data": {"text": text}}
     except HTTPException:
         raise
@@ -248,7 +265,7 @@ async def run_fallback_buffer_mode(
             tmp.write(wav_content)
             tmp_path = tmp.name
 
-        text = await asyncio.to_thread(STTService.transcribe_file, tmp_path, "audio/wav")
+        text = await STTService.transcribe_file(tmp_path, "audio/wav")
         await websocket.send_json({"is_final": True, "text": text})
     except WebSocketDisconnect:
         logger.info("WebSocket 客户端在降级转录期间断开连接")
@@ -309,6 +326,13 @@ async def gemini_to_browser(websocket: WebSocket, session, state: StreamState) -
             interim_text = (getattr(interim, "text", "") or "").strip()
             if interim_text:
                 visible_text = "".join(state.final_segments) + interim_text
+                if state.ai_observation:
+                    state.ai_observation.partial(
+                        {
+                            "phase": "interim",
+                            "text": text_content(visible_text),
+                        }
+                    )
                 await websocket.send_json(
                     {"is_final": False, "text": visible_text, "phase": "interim"}
                 )
@@ -317,6 +341,13 @@ async def gemini_to_browser(websocket: WebSocket, session, state: StreamState) -
             final_text = (getattr(final, "text", "") or "").strip()
             if final_text and (not state.final_segments or state.final_segments[-1] != final_text):
                 state.final_segments.append(final_text)
+                if state.ai_observation:
+                    state.ai_observation.partial(
+                        {
+                            "phase": "confirmed",
+                            "text": text_content("".join(state.final_segments)),
+                        }
+                    )
                 await websocket.send_json(
                     {
                         "is_final": False,
@@ -363,7 +394,22 @@ async def run_live_transcription(
         final_text = "".join(state.final_segments).strip()
         if not final_text and audio_buffer:
             raise RuntimeError("Gemini Live 未返回有效转录文本")
+        if state.ai_observation:
+            state.ai_observation.success(
+                {
+                    "text": text_content(final_text or "未识别到语音内容"),
+                    "input_audio": binary_content(
+                        f"audio/pcm;rate={state.sample_rate}",
+                        byte_count=len(audio_buffer),
+                        stream=True,
+                    ),
+                }
+            )
         await websocket.send_json({"is_final": True, "text": final_text or "未识别到语音内容"})
+    except Exception as exc:
+        if state.ai_observation:
+            state.ai_observation.failure(exc)
+        raise
     finally:
         for task in (sender_task, receiver_task):
             if not task.done():
@@ -373,12 +419,20 @@ async def run_live_transcription(
 
 @router.websocket("/api/stt/stream")
 async def speech_to_text_stream_route(websocket: WebSocket):
-    assert_websocket_api_token(websocket)
-    await websocket.accept()
+    request_observation = RequestObservation.start(
+        method="WEBSOCKET",
+        path="/api/stt/stream",
+        transport="websocket",
+    )
+    request_context_token = bind_request_id(request_observation.request_id)
     audio_buffer = bytearray()
     state = StreamState()
+    accepted = False
 
     try:
+        assert_websocket_api_token(websocket)
+        await websocket.accept()
+        accepted = True
         live_api = getattr(getattr(clients.gemini_client, "aio", None), "live", None)
         if live_api is None:
             await websocket.send_json(
@@ -391,6 +445,19 @@ async def speech_to_text_stream_route(websocket: WebSocket):
             return
 
         live_config = build_live_transcription_config()
+        state.ai_observation = AICallObservation.start(
+            operation="stt.live",
+            provider="google-gemini-live",
+            model=LIVE_MODEL,
+            input_data={
+                "audio": binary_content(
+                    f"audio/pcm;rate={state.sample_rate}",
+                    stream=True,
+                ),
+                "language_code": LIVE_LANGUAGE_CODE,
+                "transcription_mode": "SMART",
+            },
+        )
         async with connect_live_with_retry(websocket, live_api, live_config) as session:
             await websocket.send_json(
                 {
@@ -399,16 +466,33 @@ async def speech_to_text_stream_route(websocket: WebSocket):
                 }
             )
             await run_live_transcription(websocket, session, audio_buffer, state)
+    except WebSocketException as exc:
+        # 鉴权拒绝也属于请求生命周期，但不能记录 URL 查询参数中的 Token。
+        request_observation.success(f"rejected:{exc.code}")
+        raise
     except WebSocketDisconnect:
+        if state.ai_observation:
+            state.ai_observation.cancelled(
+                binary_content(
+                    f"audio/pcm;rate={state.sample_rate}",
+                    byte_count=len(audio_buffer),
+                    stream=True,
+                )
+            )
         logger.info("WebSocket 客户端断开连接")
         return
     except StreamProtocolError:
         logger.warning("实时转录协议错误", exc_info=True)
         await websocket.send_json({"is_final": True, "error": "实时转录协议错误"})
     except Exception as exc:
+        if state.ai_observation:
+            state.ai_observation.failure(exc)
         failure_type = classify_live_failure(exc)
-        if failure_type == "authentication":
-            # Live 与批处理共用 Gemini 凭证，认证失败后继续批处理只会再次失败。
+        if (
+            failure_type == "authentication"
+            and AI_PROVIDER_MODE is AIProviderMode.ORIGINAL
+        ):
+            # 原有模式的批处理仍使用同一无效 Gemini 凭证，不做无意义重试。
             logger.error("Gemini Live API 认证失败，已停止 STT 请求（%s）", type(exc).__name__)
             await websocket.send_json(
                 {
@@ -417,8 +501,13 @@ async def speech_to_text_stream_route(websocket: WebSocket):
                 }
             )
             return
-
-        if failure_type == "connection":
+        if failure_type == "authentication":
+            # 聚合平台模式使用独立凭证，可用缓冲批处理完成非实时转录。
+            logger.warning(
+                "Gemini Live API 认证失败，切换所选聚合平台的缓冲模式（%s）",
+                type(exc).__name__,
+            )
+        elif failure_type == "connection":
             # 网络握手重置属于可恢复故障，不输出冗长堆栈，直接使用已保留的 PCM 缓冲。
             logger.warning(
                 "Gemini Live API 连接中断，切换到缓冲批处理模式（%s）",
@@ -434,9 +523,24 @@ async def speech_to_text_stream_route(websocket: WebSocket):
         )
         await run_fallback_buffer_mode(websocket, audio_buffer, state)
     finally:
+        if state.ai_observation and not state.ai_observation.completed:
+            state.ai_observation.cancelled(
+                binary_content(
+                    f"audio/pcm;rate={state.sample_rate}",
+                    byte_count=len(audio_buffer),
+                    stream=True,
+                )
+            )
         try:
-            await websocket.close()
-        except WebSocketDisconnect:
-            pass
-        except RuntimeError:
-            pass
+            if accepted:
+                try:
+                    await websocket.close()
+                except WebSocketDisconnect:
+                    pass
+                except RuntimeError:
+                    pass
+        finally:
+            # 即使关闭连接本身失败，也必须完成请求日志并清理上下文。
+            if not request_observation.completed:
+                request_observation.success("closed")
+            reset_request_id(request_context_token)

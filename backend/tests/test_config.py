@@ -1,6 +1,46 @@
 from core import config
 
 
+def test_provider_mode_defaults_to_original(monkeypatch):
+    """未配置启动模式时必须优先使用原有稳定链路。"""
+    monkeypatch.delenv("AI_PROVIDER_MODE", raising=False)
+
+    assert config.get_ai_provider_mode() is config.AIProviderMode.ORIGINAL
+
+
+def test_provider_mode_supports_explicit_aggregator(monkeypatch):
+    """显式选择 aggregator 时才允许使用聚合平台。"""
+    monkeypatch.setenv("AI_PROVIDER_MODE", "aggregator")
+
+    assert config.get_ai_provider_mode() is config.AIProviderMode.AGGREGATOR
+
+
+def test_provider_mode_is_locked_for_process_lifetime(monkeypatch):
+    """进程启动后修改环境变量不能改变已经锁定的提供方常量。"""
+    startup_mode = config.AI_PROVIDER_MODE
+    replacement = (
+        "aggregator"
+        if startup_mode is config.AIProviderMode.ORIGINAL
+        else "original"
+    )
+    monkeypatch.setenv("AI_PROVIDER_MODE", replacement)
+
+    assert config.AI_PROVIDER_MODE is startup_mode
+    assert config.get_ai_provider_mode().value == replacement
+
+
+def test_provider_mode_rejects_unknown_value(monkeypatch):
+    """非法模式应在启动配置解析阶段失败，避免静默选错提供方。"""
+    monkeypatch.setenv("AI_PROVIDER_MODE", "automatic")
+
+    try:
+        config.get_ai_provider_mode()
+    except ValueError as exc:
+        assert "original, aggregator" in str(exc)
+    else:
+        raise AssertionError("非法 AI_PROVIDER_MODE 不应被接受")
+
+
 def test_http_options_use_interactive_retry_defaults(monkeypatch):
     """语音交互请求应使用有限重试，避免代理故障导致长时间等待。"""
     for name in (
@@ -49,3 +89,26 @@ def test_missing_project_env_preserves_deployment_key(monkeypatch, tmp_path):
     config.load_project_environment(tmp_path / "missing.env")
 
     assert config.os.environ["GEMINI_API_KEY"] == "deployment-key"
+
+
+def test_aggregator_audio_fast_mode_is_normalized_to_supported_auto(monkeypatch):
+    """聚合平台语音端点暂不接受 auto:fast，应无额外失败地使用 auto。"""
+    monkeypatch.setattr(config, "AI_PROVIDER_MODE", config.AIProviderMode.AGGREGATOR)
+    monkeypatch.setenv("LLM_AGGREGATOR_BASE_URL", "https://example.com/v1/")
+    monkeypatch.setenv("LLM_AGGREGATOR_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_AGGREGATOR_TTS_MODEL", "auto:fast")
+
+    settings = config.get_llm_aggregator_settings()
+
+    assert settings.available is True
+    assert settings.base_url == "https://example.com/v1"
+    assert settings.tts_model == "auto"
+
+
+def test_original_mode_does_not_enable_configured_aggregator(monkeypatch):
+    """即使保留聚合平台凭证，original 模式也不能自动切入聚合平台。"""
+    monkeypatch.setattr(config, "AI_PROVIDER_MODE", config.AIProviderMode.ORIGINAL)
+    monkeypatch.setenv("LLM_AGGREGATOR_BASE_URL", "https://example.com/v1")
+    monkeypatch.setenv("LLM_AGGREGATOR_API_KEY", "test-key")
+
+    assert config.get_llm_aggregator_settings().available is False

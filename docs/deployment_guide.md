@@ -39,12 +39,25 @@ deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart googlecloudvoice, /usr/bi
 在服务器创建 `/opt/googlecloudvoice/shared/backend.env`：
 
 ```dotenv
+# 默认使用原有稳定链路；如需聚合平台独占模式，改成 aggregator 后重启服务。
+AI_PROVIDER_MODE=original
+
 # Gemini 服务端密钥，不得写入前端或 GitHub Workflow。
 GEMINI_API_KEY=替换为真实密钥
+
+# 仅 AI_PROVIDER_MODE=aggregator 时用于普通/流式 TTS 和批量 STT。
+LLM_AGGREGATOR_BASE_URL=https://gyo.ccwu.cc/v1
+LLM_AGGREGATOR_API_KEY=替换为聚合平台密钥
+
+# 默认打印 AI 文本输入输出；文件、音频和 PCM 流只记录元数据。
+AI_LOG_TEXT_CONTENT=true
+AI_LOG_TEXT_MAX_LENGTH=12000
 
 # HTTP 和 WebSocket API 的共享访问令牌。
 API_ACCESS_TOKEN=替换为高强度随机令牌
 ```
+
+`AI_PROVIDER_MODE` 只接受 `original` 或 `aggregator`，默认推荐 `original`。提供方在应用启动时锁定，不会因请求失败自动跨模式切换；修改该值后必须重启 `googlecloudvoice`。
 
 设置文件权限：
 
@@ -288,6 +301,26 @@ sudo journalctl -u googlecloudvoice --since "30 minutes ago" --no-pager
 sudo journalctl -u googlecloudvoice -p warning --no-pager
 ```
 
+只跟踪 TTS 提供方切换和失败原因：
+
+```bash
+sudo journalctl -u googlecloudvoice -f --no-pager \
+  | grep --line-buffered -E '聚合平台.*TTS|Edge.*TTS|Gemini.*TTS|所有 TTS'
+```
+
+聚合平台错误日志会包含 HTTP 状态、请求模型、上游错误类型/错误码/消息，以及上游提供的请求 ID、路由提供方和重试时间等诊断字段。Edge、Gemini 错误会显示被业务异常包装的底层异常链。日志会清除已配置的 API Key、访问令牌和常见认证字段。
+
+只跟踪请求和 AI 输入输出：
+
+```bash
+sudo journalctl -u googlecloudvoice -f --no-pager \
+  | grep --line-buffered -E 'API_REQUEST|AI_CALL'
+```
+
+`API_REQUEST` 记录请求 ID、方法、路径、状态和耗时，不记录查询参数、请求头或请求体。`AI_CALL` 使用相同请求 ID 记录提供方、模型、AI 文本输入/输出和调用耗时；实时转录文本会以增量事件出现。音频、上传文件、PCM 分片和响应文件流始终只记录 MIME 类型、字节数等元数据，不输出二进制内容。
+
+默认 `AI_LOG_TEXT_CONTENT=true`。若生产数据可能包含敏感文本，设置为 `false` 后重启服务，此时只保留字符数；`AI_LOG_TEXT_MAX_LENGTH` 控制单个文本字段的最大记录字符数，默认 `12000`，设置 `0` 表示不截断。
+
 确认日志来自当前重启后的进程：
 
 ```bash
@@ -298,7 +331,7 @@ printf 'pid=%s active_since=%s\n' "$current_pid" "$active_since"
 sudo journalctl -u googlecloudvoice --since "$active_since" --no-pager
 ```
 
-应用会记录 TTS 提供方切换、Gemini 模型失败、STT Live API 降级、客户端断开和异常堆栈，但不会记录音频内容、TTS 原文、API Token 或请求头。Uvicorn 原始访问日志被显式关闭，因为 WebSocket 鉴权 Token 当前位于 URL 查询参数中，直接记录访问 URL 会泄露凭证。
+应用会记录 TTS 提供方切换、Gemini 模型失败、STT Live API 降级、客户端断开、AI 文本输入输出和异常堆栈，但不会记录音频/文件内容、API Token、查询参数或请求头。Uvicorn 原始访问日志被显式关闭，因为 WebSocket 鉴权 Token 当前位于 URL 查询参数中，直接记录访问 URL 会泄露凭证。
 
 查看 journald 占用空间：
 

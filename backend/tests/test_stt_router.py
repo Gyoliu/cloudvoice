@@ -1,7 +1,9 @@
 import asyncio
+import json
+import logging
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, WebSocketException
 from routers import stt as stt_router
 from routers.stt import (
     LIVE_LANGUAGE_CODE,
@@ -48,6 +50,11 @@ def test_live_failure_preserves_unexpected_errors():
 
 def test_stream_route_stops_immediately_on_authentication_failure(monkeypatch):
     """Live 认证失败时不应继续调用共用同一无效凭证的批处理服务。"""
+    monkeypatch.setattr(
+        stt_router,
+        "AI_PROVIDER_MODE",
+        stt_router.AIProviderMode.ORIGINAL,
+    )
 
     class FailingConnection:
         async def __aenter__(self):
@@ -108,6 +115,31 @@ def test_stream_route_stops_immediately_on_authentication_failure(monkeypatch):
     ]
     assert fake_live_api.connect_calls == 2
     assert websocket.closed is True
+
+
+def test_stream_route_logs_rejected_request_without_token(caplog):
+    """WebSocket 鉴权失败也应记录请求，但不得输出查询参数 Token。"""
+
+    class FakeWebSocket:
+        query_params = {"token": "invalid-secret-token"}
+
+        async def accept(self):
+            raise AssertionError("鉴权失败时不应接受连接")
+
+    caplog.set_level(logging.INFO, logger="request.observability")
+    with pytest.raises(WebSocketException):
+        asyncio.run(speech_to_text_stream_route(FakeWebSocket()))
+
+    request_logs = [
+        json.loads(record.getMessage().removeprefix("API_REQUEST "))
+        for record in caplog.records
+        if record.name == "request.observability"
+    ]
+    assert [payload["event"] for payload in request_logs] == ["request", "response"]
+    assert request_logs[1]["status"] == "rejected:1008"
+    assert "invalid-secret-token" not in " ".join(
+        record.getMessage() for record in caplog.records
+    )
 
 
 def test_live_connect_retries_handshake_once_before_streaming(monkeypatch):

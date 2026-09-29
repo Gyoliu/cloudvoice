@@ -1,21 +1,44 @@
 # 核心模型增强与个性化参数配置指南
 
-项目的 TTS 优先使用 Microsoft Edge TTS，STT 与 TTS 降级路径使用 Gemini。下列参数用于说明各路径的可配置能力。
+项目通过 `AI_PROVIDER_MODE` 在启动时固定选择原有实现或 LLM 聚合平台。默认 `original`，优先保证原有 Edge/Gemini 链路稳定性；`aggregator` 模式只使用聚合平台，不做跨模式自动降级。Gemini Live 实时转录不经过聚合平台。
 
 ---
 
 ## 1. 文字转语音 (TTS) 个性化参数
-**首选服务**：Microsoft Edge TTS，固定中文男声 `zh-CN-YunxiNeural`，输出 MP3。
+**`original` 模式（默认）**：普通 TTS 使用 Microsoft Edge TTS（MP3），Edge 失败后使用 Google Gemini SDK（WAV）。Google 路径优先 `gemini-3.8-flash-tts`，再保留旧模型兼容链；流式 TTS 只使用 Edge。
 
-**降级服务**：Google Gemini TTS 模型组，输出 WAV。
+**`aggregator` 模式**：普通和流式 TTS 只调用聚合平台 `/v1/audio/speech`，模型路由为 `auto`，音色为 `zh-CN-YunxiNeural`。平台失败时直接返回错误，不切换 Edge 或 Google。
 
-**流式播放**：`POST /api/tts/stream` 仅使用 Edge TTS。浏览器通过 MediaSource 逐块追加 `audio/mpeg` 数据；Edge 失败时结束请求，不调用 Gemini。
+**流式播放**：`POST /api/tts/stream` 按启动模式透传 Edge MP3 或聚合平台 HTTP 音频响应。浏览器可流式播放聚合平台当前实际返回的 PCM WAV，也兼容 Edge MP3。聚合平台当前仍是完整合成后响应，不是生成阶段的 SSE 音频增量；详见 `docs/llm_aggregator_implementation.md`。
 
 ### 可配置参数：
-*   **`voice_name`（Gemini 降级音色）**
-    *   **作用**：仅在 Edge TTS 失败并切换到 Gemini 后决定播报员的基础音色，默认 `Charon` 男声。
+*   **`voice_name`（original 模式 Gemini 音色）**
+    *   **作用**：仅在 `original` 模式中 Edge 失败并进入 Gemini SDK 后决定基础音色，默认 `Charon` 男声。
     *   **可选值**：`Aoede` (温和女声)、`Puck` (活力男声)、`Charon` (沉稳男声)、`Kore` (清脆女声)、`Fenrir` (粗犷男声)、`Leda` (知性女声)。
-    *   *配置方法*：通过 `/api/tts` 请求字段传入；正常 Edge 路径始终使用 `zh-CN-YunxiNeural`。
+    *   *配置方法*：通过 `/api/tts` 请求字段传入；聚合平台与 Edge 路径均使用 `zh-CN-YunxiNeural`。
+
+### 提供方与聚合平台环境变量
+
+- `AI_PROVIDER_MODE=original`：默认原有稳定模式；可选 `aggregator`。修改后必须重启服务。
+- `LLM_AGGREGATOR_BASE_URL=https://gyo.ccwu.cc/v1`
+- `LLM_AGGREGATOR_API_KEY=$YOUR_KEY`
+- `LLM_AGGREGATOR_TTS_MODEL=auto`：实测音频端点不接受 `auto:fast`；程序会自动将其规范为 `auto`。
+- `LLM_AGGREGATOR_TTS_VOICE=zh-CN-YunxiNeural`
+- `LLM_AGGREGATOR_STT_MODEL=auto:fast`
+- `LLM_AGGREGATOR_CONNECT_TIMEOUT_SECONDS=3`
+- `LLM_AGGREGATOR_TTS_TIMEOUT_SECONDS=20`
+- `LLM_AGGREGATOR_STT_TIMEOUT_SECONDS=45`
+- `AI_LOG_TEXT_CONTENT=true`：默认记录 AI 文本输入输出；设为 `false` 时正文替换为禁用标记，仅保留字符数。
+- `AI_LOG_TEXT_MAX_LENGTH=12000`：单个文本字段最多记录的字符数；`0` 表示不截断。
+
+`LLM_AGGREGATOR_ENABLED` 已不再参与路由选择。即使服务器保留聚合平台 Key，`AI_PROVIDER_MODE=original` 也不会自动调用聚合平台。
+
+### 请求与 AI 调用日志
+
+- `API_REQUEST`：记录 HTTP/WebSocket 的 `request_id`、方法、路径、传输类型、状态和耗时。不会读取或记录查询参数、请求头、请求体和上传内容。
+- `AI_CALL`：记录 `request_id`、`call_id`、操作、提供方、模型、耗时以及 AI 文本输入/输出；Gemini Live 的临时和确认文本以 `partial_response` 事件持续输出。
+- 文件、音频、PCM 分片及 TTS 响应流一律显示为 `<binary omitted>`，仅附带内容类型、字节数和流标记，不受文本日志开关影响。
+- API Key、Bearer Token 与常见认证字段由异常日志脱敏逻辑过滤。AI 文本本身仍可能包含业务敏感信息，生产环境应根据数据分级关闭正文或缩短截断长度。
 
 *   **`system_instruction` (系统指令 / 人设注入)**
     *   **作用**：这是 Gemini 语音生成最强大的特性！你可以通过文本规定它“带有什么样的情绪去朗读”。
@@ -58,9 +81,11 @@
 
 务必配置 `API_ACCESS_TOKEN`。所有 `/api` HTTP 与 `/api/stt/stream` WebSocket 都要求携带同一 Token；未配置时接口返回 503。
 
-**降级路径**：`gemini-3.5-transcribe-live`
+**后端实时路径**：`gemini-3.5-transcribe-live`
 
 版本、构造器、安全上下文或运行时服务检查失败时，项目使用专用实时 STT 模型，通过 `input_audio_transcription` 接收增量和最终转录文本。
+
+聚合平台当前不能处理此实时增量协议，因此两种启动模式的后端实时阶段都使用 Gemini Live。Live 失败后，服务端将已有 PCM 缓冲封装为 WAV，再交给当前启动模式对应的批量 STT；不会临时切换到另一种模式。
 
 ### 可配置参数：
 *   **`language_codes=["cmn-Hans-CN"]`**

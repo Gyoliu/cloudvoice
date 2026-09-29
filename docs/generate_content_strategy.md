@@ -1,37 +1,41 @@
-# Gemini API (generate_content) 免费调用方案
+# Gemini API 与提供方选择方案
 
 ## 1. 方案定位
-本项目完全基于 Google AI Studio 提供的**免费层级 (Free Tier)** 构建。
-音频解析 (STT) 使用 Gemini API；音频合成 (TTS) 优先使用 Edge TTS，只有 Edge 失败时才调用 Gemini `generate_content` 降级。
 
-## 2. 免费层级核心规则
-根据官方定价文档，针对我们使用的 Gemini Flash 模型，免费方案的具体参数如下：
+项目默认使用原有稳定模式，通过 `AI_PROVIDER_MODE=original` 保留 Microsoft Edge 与 Google Gemini SDK 实现。需要统一聚合平台时，启动前改为 `AI_PROVIDER_MODE=aggregator`。两种模式互斥，不采用聚合平台失败后自动切换 SDK 的熔断策略。
 
-- **基础资费**：所有输入 Tokens（如上传的音频文件长度、Prompt 提示词）与输出 Tokens（如生成的文本、返回的音频流）**完全免费**。
-- **并发与速率限制 (Rate Limits)**：
-  - 每分钟请求数 (RPM): **15 次**
-  - 每分钟处理量 (TPM): **100 万 Tokens**
-  - 每天总请求数 (RPD): **1500 次**
-  *评估：对于个人开发、日常工具或小范围使用的自动化播报系统，该额度完全足够支撑。*
+## 2. 启动模式
 
-## 3. 架构调用实现 (主从降级策略)
-为了提高可用性，项目在 STT 和 TTS 服务中均引入了 **降级 (Fallback)** 机制：
+### `original`（默认推荐）
 
-1. **文字转语音 (TTS - 单人音频)**：
-   - **首选服务**：Microsoft Edge TTS，固定使用 `zh-CN-YunxiNeural` 中文男声并返回 MP3。
-   - **降级服务**：Google Gemini TTS，默认使用 `Charon` 男声并返回 WAV。
-   - **逻辑**：Edge TTS 连接、接收、超时或空音频均视为失败；后端随后在线程池调用现有 Gemini 模型组，避免阻塞异步接口。
-   - **流式例外**：`/api/tts/stream` 直接透传 Edge MP3 分片，严格不调用 Gemini；上游失败时返回 502 或提前结束已经开始的响应流。
+- 普通 TTS：Microsoft Edge TTS → Google Gemini SDK。
+- 流式 TTS：Microsoft Edge TTS。
+- 批量 STT：`gemini-3.6-flash` → `gemini-3.5-flash`。
+- Google TTS：优先 `gemini-3.8-flash-tts` Interactions API，再尝试兼容模型。
 
-2. **语音转文字 (STT - 文件上传与缓冲录音)**：
-   - **首选模型**：`gemini-3.6-flash`（最新、最强智商与速度表现）。
-   - **降级模型**：`gemini-3.5-flash`（稳定可靠的兜底模型）。
-   - **逻辑**：将录音文件通过 `client.files.upload()` 上传后交由首选模型识别，报错则无缝降级。
+这些降级只发生在原有实现内部，用于延续已经验证过的稳定性。
 
-## 4. ⚠️ 核心注意事项 (隐私红线)
-由于本项目明确**只使用免费方案**，请务必注意以下由 Google 官方列出的免费层级协议限制：
+### `aggregator`
 
-- **模型训练收集**：在免费层级下，您请求 API 时发送的**所有输入内容**（包括您对麦克风说的录音、上传的本地音频文件，以及要求朗读的文字）都有可能**被 Google 收集并用于改进 Google 产品或训练未来模型**。
-- **使用建议**：
-  1. **禁止**使用此系统识别或朗读涉及公司商业机密、客户隐私、财务数据或个人敏感信息的录音。
-  2. 此系统非常适合用于：新闻播报自动化、非敏感的外语口语练习录音解析、个人开源玩具、公开课录音转录等场景。
+- 普通与流式 TTS：只调用 `/v1/audio/speech`。
+- 批量与缓冲 STT：只调用 `/v1/audio/transcriptions`。
+- 平台发生连接、超时、HTTP 或格式错误时直接向接口返回失败，不调用 Edge 或 Gemini 批处理 SDK。
+
+聚合平台当前不提供本项目所需的实时增量 STT，因此后端实时录音仍使用 Gemini Live；Live 失败后的完整缓冲识别会遵循所选启动模式。
+
+## 3. 配置示例
+
+```dotenv
+# 默认稳定模式
+AI_PROVIDER_MODE=original
+
+# 如需聚合平台独占模式，改成 aggregator 并重启服务
+LLM_AGGREGATOR_BASE_URL=https://gyo.ccwu.cc/v1
+LLM_AGGREGATOR_API_KEY=$YOUR_KEY
+```
+
+`AI_PROVIDER_MODE` 只在进程启动时读取。修改后必须重启服务，不提供请求级或前端动态切换。
+
+## 4. 隐私注意事项
+
+无论选择哪个云端提供方，都不应提交公司机密、客户隐私、财务数据或其他敏感信息。使用 Google 免费层级时，还应单独核对当前 Google 服务条款及数据使用政策。

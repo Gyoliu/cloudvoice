@@ -18,7 +18,7 @@
 | 功能 | 方法 | 路径 | 请求类型 | 成功响应 |
 |---|---|---|---|---|
 | 普通文字转语音 | `POST` | `/api/tts` | `application/json` | `audio/mpeg` 或 `audio/wav` |
-| Edge TTS 流式播放 | `POST` | `/api/tts/stream` | `application/json` | `audio/mpeg` 分块响应 |
+| TTS 流式播放 | `POST` | `/api/tts/stream` | `application/json` | `audio/wav` 或 `audio/mpeg` 分块响应 |
 | 上传音频转文字 | `POST` | `/api/stt/upload` | `multipart/form-data` | JSON |
 | 实时录音转文字 | `WebSocket` | `/api/stt/stream` | JSON 控制帧 + PCM 二进制帧 | JSON 消息流 |
 
@@ -53,7 +53,7 @@
 
 ### `POST /api/tts`
 
-优先调用 Microsoft Edge TTS，固定使用中文男声 `zh-CN-YunxiNeural` 并返回 MP3。Edge 调用失败时，自动切换 Google Gemini TTS 并返回 WAV。
+调用链由进程启动时的 `AI_PROVIDER_MODE` 决定。默认 `original` 使用 Microsoft Edge TTS，失败后进入 Google Gemini SDK；`aggregator` 只调用 LLM 聚合平台 `/v1/audio/speech`，失败时不切换原有链路。
 
 ### 2.1 请求
 
@@ -62,9 +62,9 @@
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |---|---|---:|---|---|
 | `text` | string | 是 | - | 需要朗读的文本，至少 1 个字符 |
-| `voice_name` | enum | 否 | `Charon` | 仅用于 Gemini 降级路径 |
+| `voice_name` | enum | 否 | `Charon` | 仅用于 original 模式的 Google Gemini SDK 路径 |
 
-`voice_name` 可选值：`Aoede`、`Puck`、`Charon`、`Kore`、`Fenrir`、`Leda`。正常 Edge 路径忽略该字段。
+`voice_name` 可选值：`Aoede`、`Puck`、`Charon`、`Kore`、`Fenrir`、`Leda`。聚合平台与 Edge 路径忽略该字段，使用部署配置中的 `zh-CN-YunxiNeural`。
 
 ```json
 {
@@ -79,6 +79,7 @@
 
 | 实际提供方 | `Content-Type` | `X-TTS-Provider` | 响应体 |
 |---|---|---|---|
+| LLM 聚合平台 | 按文件签名确定，当前为 `audio/wav` | `llm-aggregator` | 完整音频文件 |
 | Microsoft Edge | `audio/mpeg` | `microsoft-edge` | 完整 MP3 文件 |
 | Google Gemini | `audio/wav` | `google-gemini` | 完整 WAV 文件 |
 
@@ -96,13 +97,15 @@ curl -X POST http://localhost:8000/api/tts \
 | 状态码 | 场景 | `detail` |
 |---:|---|---|
 | `422` | 缺少 `text`、空字符串或 `voice_name` 不在枚举中 | FastAPI 校验错误数组 |
-| `502` | Edge 和 Gemini 均生成失败 | `语音生成服务暂时不可用` |
+| `502` | 当前启动模式的 TTS 调用失败 | `语音生成服务暂时不可用` |
 
-## 3. Edge TTS 流式播放
+## 3. TTS 流式播放
 
 ### `POST /api/tts/stream`
 
-仅使用 Microsoft Edge TTS 和 `zh-CN-YunxiNeural`。服务端取得首个 MP3 分片后发送响应头，后续音频通过同一个 HTTP 响应体持续传输，不会降级到 Gemini。
+`original` 模式只使用 Microsoft Edge TTS 流；`aggregator` 模式只调用聚合平台 `/v1/audio/speech`。服务端在识别首批音频的真实格式后才发送响应头，后续音频通过同一个 HTTP 响应体持续传输。任一模式启动失败时直接返回 `502`，不会切换到另一模式。
+
+当前聚合平台会先完成上游合成，再返回带 `Content-Length` 的二进制音频；其 `stream=true` 与 `stream_format=sse` 尚不构成正式 TTS 流式契约。因此本接口能避免本项目后端再次完整缓存，并让浏览器边下载边播放，但聚合平台路径的首包时间仍包含上游完整合成耗时。核验细节见 `docs/llm_aggregator_implementation.md`。
 
 ### 3.1 请求
 
@@ -124,27 +127,27 @@ curl -X POST http://localhost:8000/api/tts \
 
 | 响应头 | 值 | 说明 |
 |---|---|---|
-| `Content-Type` | `audio/mpeg` | MP3 音频分片 |
-| `X-TTS-Provider` | `microsoft-edge` | 固定提供方 |
+| `Content-Type` | `audio/wav` 或 `audio/mpeg` | 按音频魔数识别，不信任上游错误响应头 |
+| `X-TTS-Provider` | `llm-aggregator` 或 `microsoft-edge` | 本次实际提供方 |
 | `Cache-Control` | `no-store` | 禁止缓存 |
 | `X-Accel-Buffering` | `no` | 提示 Nginx 不缓冲响应 |
 
-浏览器前端使用 `MediaSource` 和 `SourceBuffer("audio/mpeg")` 追加分片。调用前应检查 `MediaSource.isTypeSupported("audio/mpeg")`；不支持该能力的浏览器不能使用项目内置的流式播放器。
+浏览器对 MP3 使用 `MediaSource` 追加分片；对 16-bit PCM WAV 则解析 RIFF 文件头，并使用 Web Audio API 连续调度 PCM 分片。这样聚合平台即使错误声明 `audio/mpeg`、实际返回 WAV，仍能边接收边播放。
 
 ### 3.3 错误与中断语义
 
 | 场景 | 行为 |
 |---|---|
-| 首个音频分片产生前失败 | 返回 `502`，`detail` 为 `Edge 流式语音服务暂时不可用` |
-| 响应已经开始后 Edge 中断 | HTTP 音频流提前结束，无法再改写为 JSON 错误 |
-| 客户端取消请求 | 后端关闭 Edge 上游异步生成器，不调用 Gemini |
+| 当前模式在首个分片前失败 | 返回 `502`，`detail` 为 `流式语音服务暂时不可用` |
+| 响应已经开始后上游中断 | HTTP 音频流提前结束，无法混入另一种音频编码继续降级 |
+| 客户端取消请求 | 后端关闭当前上游异步生成器和网络连接 |
 | 请求体不合法 | 返回 `422` |
 
 ## 4. 上传音频转文字
 
 ### `POST /api/stt/upload`
 
-接收一个音频文件，保存为临时文件并上传至 Gemini。当前依次尝试 `gemini-3.6-flash` 和 `gemini-3.5-flash`，成功后返回纯转录文本，并尝试删除 Gemini 远端临时文件。
+接收一个音频文件并保存为临时文件。`original` 模式上传至 Gemini，并依次尝试 `gemini-3.6-flash` 和 `gemini-3.5-flash`；`aggregator` 模式只提交到聚合平台 `/v1/audio/transcriptions`。当前模式失败时不会切换另一模式。Gemini 路径完成后会尝试删除远端临时文件。
 
 ### 4.1 请求
 
@@ -344,7 +347,7 @@ Edge 浏览器识别成功后不调用本项目 STT 接口。遇到 `network`、
 2. Live 会话正常工作时，服务端持续返回 `interim` 和 `confirmed` 文本，实现边录边输出。
 3. 两次握手均失败，或者会话中途失败时，服务端使用已经保留的 PCM 缓冲进入批处理模式。
 4. 缓冲模式只在收到 `stop` 后提交完整 WAV，因此不会边录边输出。
-5. 持续认证失败时，Live 和批处理共用同一个 Gemini 凭证，服务端直接返回凭证错误，不执行无意义的批处理调用。
+5. Live 认证失败时，`original` 模式直接返回 Gemini 凭证错误；`aggregator` 模式可使用独立平台凭证完成缓冲识别。
 6. 停止录音后最多等待 Live 最终结果 10 秒；超时后使用已经确认的片段。
 
 ## 6. 配置项
@@ -352,13 +355,33 @@ Edge 浏览器识别成功后不调用本项目 STT 接口。遇到 `network`、
 | 环境变量 | 默认值 | 说明 |
 |---|---:|---|
 | `API_ACCESS_TOKEN` | 无 | 后端 `/api` 访问 Token；未配置时所有 `/api` 返回 503 |
-| `GEMINI_API_KEY` | 无 | Gemini API 凭证；STT 和 Gemini TTS 降级共用 |
+| `AI_PROVIDER_MODE` | `original` | 启动提供方；仅允许 `original` 或 `aggregator`，修改后必须重启 |
+| `AI_LOG_TEXT_CONTENT` | `true` | 是否记录 AI 文本输入输出；关闭后仅记录字符数 |
+| `AI_LOG_TEXT_MAX_LENGTH` | `12000` | 单个文本日志最大字符数；`0` 表示不截断 |
+| `GEMINI_API_KEY` | 无 | original 模式的 STT/TTS，以及两种模式共用的后端实时 STT |
+| `LLM_AGGREGATOR_BASE_URL` | 空 | 聚合平台 API 根地址，例如 `https://gyo.ccwu.cc/v1` |
+| `LLM_AGGREGATOR_API_KEY` | 空 | 聚合平台 Bearer Token |
+| `LLM_AGGREGATOR_TTS_MODEL` | `auto` | TTS 路由模型；当前 `auto:fast` 会规范为 `auto` |
+| `LLM_AGGREGATOR_TTS_VOICE` | `zh-CN-YunxiNeural` | 聚合平台 TTS 音色 |
+| `LLM_AGGREGATOR_STT_MODEL` | `auto:fast` | 批量 STT 路由模型 |
+| `LLM_AGGREGATOR_CONNECT_TIMEOUT_SECONDS` | `3` | 聚合平台连接超时，单位秒 |
+| `LLM_AGGREGATOR_TTS_TIMEOUT_SECONDS` | `20` | TTS 相邻响应分片读取超时，单位秒 |
+| `LLM_AGGREGATOR_STT_TIMEOUT_SECONDS` | `45` | STT 请求超时，单位秒 |
 | `GEMINI_HTTP_TIMEOUT_MS` | `30000` | 普通 Gemini HTTP 请求超时，单位毫秒 |
 | `GEMINI_HTTP_RETRY_ATTEMPTS` | `3` | 普通 HTTP 请求总尝试次数，包含首次请求 |
 | `GEMINI_TRUST_ENV` | `true` | 是否读取系统代理环境变量 |
 | `GEMINI_PROXY` | 空 | 可选固定代理地址 |
 
-本地存在 `backend/.env` 时，其中的配置覆盖终端遗留同名变量；部署环境没有该文件时，使用容器或系统注入的环境变量。Live WebSocket 的快速重连次数和间隔当前是代码常量，不受上述 HTTP 重试配置控制。
+本地存在 `backend/.env` 时，其中的配置覆盖终端遗留同名变量；部署环境没有该文件时，使用容器或系统注入的环境变量。`AI_PROVIDER_MODE` 在进程启动时锁定，不会因单次请求失败自动改变；旧配置 `LLM_AGGREGATOR_ENABLED` 不再参与路由选择。Live WebSocket 的快速重连次数和间隔当前是代码常量，不受上述 HTTP 重试配置控制。
+
+### 可观测日志
+
+每个 HTTP 与 WebSocket 请求生成服务端 `request_id`。HTTP 响应同时返回 `X-Request-ID`；同一请求触发的 AI 调用通过日志中的 `request_id` 关联，各次模型尝试再以 `call_id` 区分。
+
+- `API_REQUEST` 记录方法、路径、传输类型、状态和耗时，不记录查询参数、请求头或请求体。
+- `AI_CALL` 的 `request`、`partial_response`、`response` 事件记录提供方、模型、文本输入/输出、状态与耗时。
+- 音频、上传文件、PCM 分片及 TTS 文件流不记录内容，只记录 `<binary omitted>`、MIME 类型、字节数和流标记。
+- 异常链会脱敏已配置的 Key 和常见认证字段。若业务文本含敏感数据，可设置 `AI_LOG_TEXT_CONTENT=false`。
 
 ### 认证方式
 
